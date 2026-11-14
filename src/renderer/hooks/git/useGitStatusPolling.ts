@@ -1,0 +1,667 @@
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import type { Session } from '../../types';
+import { gitService } from '../../services/git';
+import { updateSessionWith } from '../../stores/sessionStore';
+import { subscribeToActivity } from '../../utils/activityBus';
+import { captureException } from '../../utils/sentry';
+
+/**
+ * Extended git status data for a session.
+ * Includes file count (for all sessions) and detailed info (for active session).
+ */
+export interface GitStatusData {
+	/** Number of changed files from git status --porcelain */
+	fileCount: number;
+	/** Current branch name */
+	branch?: string;
+	/** Remote URL (origin) */
+	remote?: string;
+	/** Number of commits behind upstream */
+	behind: number;
+	/** Number of commits ahead of upstream */
+	ahead: number;
+	/** Detailed file changes with line additions/deletions (active session only) */
+	fileChanges?: GitFileChange[];
+	/** Total line additions across all files */
+	totalAdditions: number;
+	/** Total line deletions across all files */
+	totalDeletions: number;
+	/** Number of modified files */
+	modifiedCount: number;
+	/** Timestamp when this data was last updated */
+	lastUpdated: number;
+}
+
+/**
+ * Individual file change with line-level statistics
+ */
+export interface GitFileChange {
+	path: string;
+	status: string;
+	additions: number;
+	deletions: number;
+	modified: boolean;
+}
+
+/**
+ * Return type for the useGitStatusPolling hook
+ */
+export interface UseGitStatusPollingReturn {
+	/**
+	 * Map of session ID to git status data.
+	 * Only sessions that are git repos will have entries.
+	 */
+	gitStatusMap: Map<string, GitStatusData>;
+	/**
+	 * Manually trigger a refresh of git status for all sessions.
+	 * Useful when you know files have changed and want immediate feedback.
+	 */
+	refreshGitStatus: () => Promise<void>;
+	/**
+	 * Whether the hook is currently loading data
+	 */
+	isLoading: boolean;
+}
+
+/**
+ * Configuration options for git status polling
+ */
+export interface UseGitStatusPollingOptions {
+	/**
+	 * Polling interval in milliseconds.
+	 * Default: 30000 (30 seconds)
+	 */
+	pollInterval?: number;
+	/**
+	 * Whether to pause polling when document is hidden.
+	 * Default: true
+	 */
+	pauseWhenHidden?: boolean;
+	/**
+	 * Inactivity timeout in milliseconds. Polling stops after this duration
+	 * of no user activity and resumes when activity is detected.
+	 * Default: 60000 (60 seconds)
+	 */
+	inactivityTimeout?: number;
+	/**
+	 * ID of the currently active session. Extended data (numstat, branch info)
+	 * will be fetched for this session.
+	 */
+	activeSessionId?: string;
+}
+
+const DEFAULT_POLL_INTERVAL = 30000; // 30 seconds
+const DEFAULT_INACTIVITY_TIMEOUT = 60000; // 60 seconds
+
+/**
+ * PERF: Scale polling interval based on the number of git sessions.
+ * With many sessions, each poll spawns N parallel git processes which creates
+ * sustained CPU/IO load (especially on large repos where `git status` takes seconds).
+ * Only applies when using the default poll interval; custom intervals are respected.
+ */
+const POLL_INTERVAL_SCALE_THRESHOLDS: { maxSessions: number; interval: number }[] = [
+	{ maxSessions: 3, interval: 30000 }, // 1-3 sessions: 30s (unchanged)
+	{ maxSessions: 7, interval: 45000 }, // 4-7 sessions: 45s
+	{ maxSessions: 12, interval: 60000 }, // 8-12 sessions: 60s
+	{ maxSessions: Infinity, interval: 90000 }, // 13+: 90s
+];
+
+export function getScaledPollInterval(basePollInterval: number, gitSessionCount: number): number {
+	// Only scale if using the default interval (user-configured intervals are respected)
+	if (basePollInterval !== DEFAULT_POLL_INTERVAL) return basePollInterval;
+
+	for (const threshold of POLL_INTERVAL_SCALE_THRESHOLDS) {
+		if (gitSessionCount <= threshold.maxSessions) {
+			return threshold.interval;
+		}
+	}
+	return 90000;
+}
+
+/**
+ * PERF: Compare two GitStatusData objects for meaningful changes.
+ * Ignores lastUpdated since that always changes and would cause unnecessary re-renders.
+ */
+function gitStatusDataEqual(a: GitStatusData, b: GitStatusData): boolean {
+	return (
+		a.fileCount === b.fileCount &&
+		a.branch === b.branch &&
+		a.remote === b.remote &&
+		a.behind === b.behind &&
+		a.ahead === b.ahead &&
+		a.totalAdditions === b.totalAdditions &&
+		a.totalDeletions === b.totalDeletions &&
+		a.modifiedCount === b.modifiedCount &&
+		// Compare fileChanges arrays (only present for active session)
+		(a.fileChanges?.length ?? 0) === (b.fileChanges?.length ?? 0) &&
+		(a.fileChanges?.every((f, i) => {
+			const other = b.fileChanges?.[i];
+			return (
+				other &&
+				f.path === other.path &&
+				f.status === other.status &&
+				f.additions === other.additions &&
+				f.deletions === other.deletions
+			);
+		}) ??
+			true)
+	);
+}
+
+/**
+ * PERF: Compare two git status maps for meaningful changes.
+ * Returns true if maps are equivalent (same sessions with same data).
+ */
+function gitStatusMapsEqual(
+	oldMap: Map<string, GitStatusData>,
+	newMap: Map<string, GitStatusData>
+): boolean {
+	if (oldMap.size !== newMap.size) return false;
+
+	for (const [sessionId, newData] of newMap) {
+		const oldData = oldMap.get(sessionId);
+		if (!oldData || !gitStatusDataEqual(oldData, newData)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * For sessions currently marked `isGitRepo: false`, re-check whether the
+ * working directory is now a git repo (e.g. the user ran `git init` after
+ * creating the agent). When a transition is detected, flip the session's
+ * `isGitRepo` flag and warm the branches/tags cache so worktree creation
+ * and other git-gated features become available without an app restart.
+ *
+ * Per-session failures (via `allSettled`) are isolated so one bad session
+ * doesn't block the rest, and unexpected exceptions are reported to Sentry
+ * - `gitService` already swallows IPC errors and returns defaults, so
+ * anything that reaches us here is a real bug worth seeing.
+ */
+async function detectGitRepoTransitions(sessions: Session[]): Promise<void> {
+	const results = await Promise.allSettled(
+		sessions.map(async (session) => {
+			const cwd = session.inputMode === 'terminal' ? session.shellCwd || session.cwd : session.cwd;
+			const sshRemoteId =
+				session.sshRemoteId || session.sessionSshRemoteConfig?.remoteId || undefined;
+
+			const isRepo = await gitService.isRepo(cwd, sshRemoteId);
+			if (!isRepo) return;
+
+			const [gitBranches, gitTags] = await Promise.all([
+				gitService.getBranches(cwd, sshRemoteId),
+				gitService.getTags(cwd, sshRemoteId),
+			]);
+
+			updateSessionWith(session.id, (s) =>
+				s.isGitRepo
+					? s
+					: {
+							...s,
+							isGitRepo: true,
+							gitBranches,
+							gitTags,
+							gitRefsCacheTime: Date.now(),
+						}
+			);
+		})
+	);
+
+	results.forEach((result, idx) => {
+		if (result.status === 'rejected') {
+			captureException(result.reason, {
+				extra: {
+					context: 'detectGitRepoTransitions',
+					sessionId: sessions[idx]?.id,
+				},
+			});
+		}
+	});
+}
+
+/**
+ * The reverse of `detectGitRepoTransitions`: a session marked `isGitRepo: true`
+ * whose `git status` reported "not a git repository" (the user deleted `.git`,
+ * e.g. to turn one repo into a folder of several). Clears the flag and the
+ * cached refs so the header stops showing a GIT pill for a plain directory.
+ *
+ * The poll runs in the terminal's `shellCwd`, which the user may have `cd`ed
+ * out of the repo. Only the agent's own `cwd` decides whether it is a git
+ * agent, so a miss in any other directory is confirmed against `cwd` first.
+ */
+async function demoteIfNoLongerGitRepo(
+	session: Session,
+	polledCwd: string,
+	sshRemoteId: string | undefined
+): Promise<void> {
+	if (polledCwd !== session.cwd) {
+		const rootStatus = await gitService.getStatus(session.cwd, sshRemoteId);
+		if (!rootStatus.notARepo) return;
+	}
+
+	updateSessionWith(session.id, (s) =>
+		s.isGitRepo
+			? {
+					...s,
+					isGitRepo: false,
+					changedFiles: [],
+					gitBranches: undefined,
+					gitTags: undefined,
+					gitRefsCacheTime: undefined,
+				}
+			: s
+	);
+}
+
+/**
+ * Hook that polls git status for all git repository sessions.
+ *
+ * Features:
+ * - Only polls sessions marked as git repos
+ * - Pauses polling when the app is in background (document hidden)
+ * - Pauses polling after user inactivity to save CPU
+ * - Parallelizes git status calls for better performance
+ * - Returns comprehensive git data: file counts, branch, ahead/behind, numstat
+ * - Fetches detailed numstat data only for the active session (optimization)
+ *
+ * CPU optimization: Polling stops after 60s of user inactivity and
+ * resumes immediately when user activity is detected.
+ *
+ * Consolidates git polling that was previously scattered across:
+ * - SessionList.tsx (file counts)
+ * - MainPanel.tsx (branch, remote, ahead/behind)
+ * - GitStatusWidget.tsx (numstat file changes)
+ *
+ * @param sessions - Array of all sessions to poll
+ * @param options - Optional configuration for polling behavior
+ * @returns Object containing gitStatusMap, refreshGitStatus function, and isLoading state
+ */
+export function useGitStatusPolling(
+	sessions: Session[],
+	options: UseGitStatusPollingOptions = {}
+): UseGitStatusPollingReturn {
+	const {
+		pollInterval = DEFAULT_POLL_INTERVAL,
+		pauseWhenHidden = true,
+		inactivityTimeout = DEFAULT_INACTIVITY_TIMEOUT,
+		activeSessionId,
+	} = options;
+
+	const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitStatusData>>(new Map());
+	const [isLoading, setIsLoading] = useState(false);
+
+	// Use ref to track sessions to avoid stale closure issues in interval callback
+	const sessionsRef = useRef(sessions);
+	sessionsRef.current = sessions;
+
+	// Track active session ID
+	const activeSessionIdRef = useRef(activeSessionId);
+	activeSessionIdRef.current = activeSessionId;
+
+	// Activity tracking refs
+	const lastActivityRef = useRef<number>(Date.now());
+	const isActiveRef = useRef<boolean>(true);
+	const intervalRef = useRef<NodeJS.Timeout | null>(null);
+
+	// Each session's last published entry plus the folder and SSH remote it
+	// was read from, so a session whose git timed out keeps its last good
+	// counts instead of flashing to "no changes" - but only while it is still
+	// polling the same folder. A terminal-mode `cd` into another repo must not
+	// inherit the previous repo's branch and counts. Written at the end of
+	// every pass, so a queued pass sees it before React re-renders.
+	const lastGoodRef = useRef(new Map<string, { queryKey: string; data: GitStatusData }>());
+	// The non-git re-check is fire-and-forget so it never delays the git poll,
+	// which means nothing else stops it from overlapping itself on a slow
+	// folder. One at a time, the same rule `runPoll` applies to the main poll.
+	const transitionCheckInFlightRef = useRef(false);
+
+	// Poll git status for all Git sessions
+	const pollGitStatusOnce = useCallback(async () => {
+		// Skip polling if document is hidden (app in background)
+		if (pauseWhenHidden && document.hidden) return;
+
+		const allSessions = sessionsRef.current;
+		type PollResult = readonly [sessionId: string, data: GitStatusData, queryKey: string];
+		const keepPrevious = (sessionId: string, queryKey: string): PollResult | null => {
+			const previous = lastGoodRef.current.get(sessionId);
+			return previous && previous.queryKey === queryKey
+				? [sessionId, previous.data, queryKey]
+				: null;
+		};
+		const gitSessions = allSessions.filter((s) => s.isGitRepo);
+		const nonGitSessions = allSessions.filter((s) => !s.isGitRepo);
+
+		// Re-check non-git sessions in case the user ran `git init` after
+		// agent creation. On transition, update the session so the worktree
+		// menu and other git-gated features unlock without restart.
+		// Fire-and-forget - runs in parallel with the main git poll.
+		if (nonGitSessions.length > 0 && !transitionCheckInFlightRef.current) {
+			transitionCheckInFlightRef.current = true;
+			void detectGitRepoTransitions(nonGitSessions).finally(() => {
+				transitionCheckInFlightRef.current = false;
+			});
+		}
+
+		if (gitSessions.length === 0) {
+			lastGoodRef.current = new Map();
+			setGitStatusMap((prev) => (prev.size === 0 ? prev : new Map()));
+			return;
+		}
+
+		setIsLoading(true);
+
+		try {
+			const currentActiveSessionId = activeSessionIdRef.current;
+
+			// Parallelize git status calls for better performance
+			// Sequential calls with 10 sessions = 1-2s, parallel = 200-300ms
+			const results = await Promise.all(
+				gitSessions.map(async (session): Promise<PollResult | null> => {
+					try {
+						const cwd =
+							session.inputMode === 'terminal' ? session.shellCwd || session.cwd : session.cwd;
+
+						const isActiveSession = session.id === currentActiveSessionId;
+
+						// Get SSH remote ID from session for remote git operations
+						// Note: sshRemoteId is only set after AI agent spawns. For terminal-only SSH sessions,
+						// we must fall back to sessionSshRemoteConfig.remoteId. See CLAUDE.md "SSH Remote Sessions".
+						const sshRemoteId =
+							session.sshRemoteId || session.sessionSshRemoteConfig?.remoteId || undefined;
+						const queryKey = `${sshRemoteId ?? ''}\0${cwd}`;
+
+						// For non-active sessions, just get basic status (file count)
+						if (!isActiveSession) {
+							const status = await gitService.getStatus(cwd, sshRemoteId);
+							if (status.timedOut) return keepPrevious(session.id, queryKey);
+							if (status.notARepo) {
+								await demoteIfNoLongerGitRepo(session, cwd, sshRemoteId);
+								return null;
+							}
+							const statusData: GitStatusData = {
+								fileCount: status.files.length,
+								branch: status.branch,
+								behind: 0,
+								ahead: 0,
+								totalAdditions: 0,
+								totalDeletions: 0,
+								modifiedCount: 0,
+								lastUpdated: Date.now(),
+							};
+							return [session.id, statusData, queryKey] as const;
+						}
+
+						// For active session, get comprehensive data including numstat
+						// Use git:info for branch/remote/ahead/behind (single IPC call, 4 parallel git commands)
+						// Plus get detailed file changes with numstat
+						const [gitInfo, status, numstat] = await Promise.all([
+							window.maestro.git.info(cwd, sshRemoteId),
+							gitService.getStatus(cwd, sshRemoteId),
+							gitService.getNumstat(cwd, sshRemoteId),
+						]);
+						if (gitInfo.timedOut || status.timedOut || numstat.timedOut) {
+							return keepPrevious(session.id, queryKey);
+						}
+						if (status.notARepo) {
+							await demoteIfNoLongerGitRepo(session, cwd, sshRemoteId);
+							return null;
+						}
+
+						// Create a map of path -> numstat data
+						const numstatMap = new Map<string, { additions: number; deletions: number }>();
+						numstat.files.forEach((file) => {
+							numstatMap.set(file.path, { additions: file.additions, deletions: file.deletions });
+						});
+
+						// Parse porcelain format and merge with numstat
+						const fileChanges: GitFileChange[] = [];
+						let totalAdditions = 0;
+						let totalDeletions = 0;
+						let modifiedCount = 0;
+
+						status.files.forEach((file) => {
+							const statusCode = file.status.trim();
+							const indexStatus = statusCode[0];
+							const workingStatus = statusCode[1] || ' ';
+							const stats = numstatMap.get(file.path) || { additions: 0, deletions: 0 };
+
+							const change: GitFileChange = {
+								path: file.path,
+								status: statusCode,
+								additions: stats.additions,
+								deletions: stats.deletions,
+								modified: false,
+							};
+
+							// Accumulate totals
+							totalAdditions += stats.additions;
+							totalDeletions += stats.deletions;
+
+							// Check for modifications
+							if (
+								indexStatus === 'M' ||
+								workingStatus === 'M' ||
+								indexStatus === 'R' ||
+								workingStatus === 'R'
+							) {
+								change.modified = true;
+								modifiedCount++;
+							}
+
+							fileChanges.push(change);
+						});
+
+						const statusData: GitStatusData = {
+							fileCount: status.files.length,
+							branch: gitInfo.branch,
+							remote: gitInfo.remote,
+							behind: gitInfo.behind,
+							ahead: gitInfo.ahead,
+							fileChanges,
+							totalAdditions,
+							totalDeletions,
+							modifiedCount,
+							lastUpdated: Date.now(),
+						};
+
+						return [session.id, statusData, queryKey] as const;
+					} catch {
+						return null;
+					}
+				})
+			);
+
+			const newStatusMap = new Map<string, GitStatusData>();
+			const newLastGood = new Map<string, { queryKey: string; data: GitStatusData }>();
+			for (const result of results) {
+				if (result) {
+					const [sessionId, data, queryKey] = result;
+					newStatusMap.set(sessionId, data);
+					newLastGood.set(sessionId, { queryKey, data });
+				}
+			}
+			lastGoodRef.current = newLastGood;
+
+			// PERF: Only update state if data actually changed to prevent cascade re-renders
+			setGitStatusMap((prev) => (gitStatusMapsEqual(prev, newStatusMap) ? prev : newStatusMap));
+		} finally {
+			setIsLoading(false);
+		}
+	}, [pauseWhenHidden]);
+
+	// At most one poll at a time. On a folder where git hangs (iCloud Drive
+	// offloading), overlapping polls are how stuck `git status` processes
+	// piled up by the hundred. A timer tick that lands mid-poll is dropped;
+	// an explicit refresh joins the running poll and queues one more pass,
+	// since the running one may predate the change that asked for it.
+	const pollInFlightRef = useRef<Promise<void> | null>(null);
+	const pollAgainRef = useRef(false);
+	const runPoll = useCallback(
+		(fromTimer: boolean): Promise<void> => {
+			if (pollInFlightRef.current) {
+				if (!fromTimer) pollAgainRef.current = true;
+				return pollInFlightRef.current;
+			}
+			const run = (async () => {
+				try {
+					do {
+						pollAgainRef.current = false;
+						await pollGitStatusOnce();
+					} while (pollAgainRef.current);
+				} finally {
+					pollInFlightRef.current = null;
+				}
+			})();
+			pollInFlightRef.current = run;
+			return run;
+		},
+		[pollGitStatusOnce]
+	);
+	const pollGitStatus = useCallback(() => runPoll(false), [runPoll]);
+
+	// PERF: Track git session count to dynamically scale the polling interval
+	const gitSessionCount = useMemo(() => sessions.filter((s) => s.isGitRepo).length, [sessions]);
+	const gitSessionCountRef = useRef(gitSessionCount);
+	gitSessionCountRef.current = gitSessionCount;
+
+	const startPolling = useCallback(() => {
+		if (!intervalRef.current && (!pauseWhenHidden || !document.hidden)) {
+			pollGitStatus();
+			// Scale interval based on how many git sessions are active
+			const scaledInterval = getScaledPollInterval(pollInterval, gitSessionCountRef.current);
+			intervalRef.current = setInterval(() => {
+				const now = Date.now();
+				const timeSinceLastActivity = now - lastActivityRef.current;
+
+				// Check if user is still active
+				if (timeSinceLastActivity < inactivityTimeout) {
+					void runPoll(true);
+				} else {
+					// User inactive - stop polling to save CPU
+					isActiveRef.current = false;
+					if (intervalRef.current) {
+						clearInterval(intervalRef.current);
+						intervalRef.current = null;
+					}
+				}
+			}, scaledInterval);
+		}
+	}, [pollInterval, inactivityTimeout, pollGitStatus, runPoll]);
+
+	const stopPolling = useCallback(() => {
+		if (intervalRef.current) {
+			clearInterval(intervalRef.current);
+			intervalRef.current = null;
+		}
+	}, []);
+
+	// Handle visibility changes
+	useEffect(() => {
+		const handleVisibilityChange = () => {
+			if (document.hidden) {
+				stopPolling();
+			} else if (isActiveRef.current) {
+				startPolling();
+			}
+		};
+
+		if (pauseWhenHidden) {
+			document.addEventListener('visibilitychange', handleVisibilityChange);
+		}
+
+		return () => {
+			if (pauseWhenHidden) {
+				document.removeEventListener('visibilitychange', handleVisibilityChange);
+			}
+		};
+	}, [pauseWhenHidden, startPolling, stopPolling]);
+
+	// Debounce timer ref for activity handler
+	const activityDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	// Ref to access startPolling without adding to effect deps
+	const startPollingRef = useRef(startPolling);
+	startPollingRef.current = startPolling;
+
+	// Listen for user activity to restart polling if inactive
+	// Uses debouncing to avoid excessive callback execution on rapid events
+	// Activity events come from the shared activity bus (passive listeners shared with
+	// useActivityTracker and useHandsOnTimeTracker)
+	useEffect(() => {
+		const handleActivity = () => {
+			// Clear any pending debounce timer
+			if (activityDebounceRef.current) {
+				clearTimeout(activityDebounceRef.current);
+			}
+
+			// Debounce activity updates to reduce CPU overhead (100ms)
+			activityDebounceRef.current = setTimeout(() => {
+				lastActivityRef.current = Date.now();
+				const wasInactive = !isActiveRef.current;
+				isActiveRef.current = true;
+
+				// Restart polling if it was stopped due to inactivity
+				if (wasInactive && (!pauseWhenHidden || !document.hidden)) {
+					startPollingRef.current();
+				}
+				activityDebounceRef.current = null;
+			}, 100);
+		};
+
+		const unsubscribe = subscribeToActivity(handleActivity);
+
+		return () => {
+			unsubscribe();
+			// Clean up any pending debounce timer
+			if (activityDebounceRef.current) {
+				clearTimeout(activityDebounceRef.current);
+			}
+		};
+	}, [pauseWhenHidden]);
+
+	// Initial start and cleanup
+	useEffect(() => {
+		if (!pauseWhenHidden || !document.hidden) {
+			startPolling();
+		}
+
+		return () => {
+			stopPolling();
+		};
+	}, [pauseWhenHidden, startPolling, stopPolling]);
+
+	// PERF: Restart polling when git session count crosses a scaling threshold
+	// so the interval adapts to the current load level
+	const prevScaledIntervalRef = useRef(getScaledPollInterval(pollInterval, gitSessionCount));
+	useEffect(() => {
+		// Ensure ref reflects current count before startPolling reads it.
+		// (The render-phase assignment at line 330 already does this, but being
+		// explicit here makes the data-flow self-documenting.)
+		gitSessionCountRef.current = gitSessionCount;
+
+		const newScaledInterval = getScaledPollInterval(pollInterval, gitSessionCount);
+		if (newScaledInterval !== prevScaledIntervalRef.current) {
+			prevScaledIntervalRef.current = newScaledInterval;
+			// Restart with new interval if currently polling
+			if (intervalRef.current) {
+				stopPolling();
+				if (isActiveRef.current && (!pauseWhenHidden || !document.hidden)) {
+					startPolling();
+				}
+			}
+		}
+	}, [gitSessionCount, pollInterval, stopPolling, startPolling, pauseWhenHidden]);
+
+	// Refresh immediately when active session changes to get detailed data
+	useEffect(() => {
+		if (activeSessionId) {
+			pollGitStatus();
+		}
+	}, [activeSessionId, pollGitStatus]);
+
+	return {
+		gitStatusMap,
+		refreshGitStatus: pollGitStatus,
+		isLoading,
+	};
+}

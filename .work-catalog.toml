@@ -1,0 +1,13 @@
+# Project metadata for work-catalog. Edit deliberately; refresh imports changes.
+schema_version = 1
+
+[project]
+id = "maestro-f8644ed6"
+purpose = "Maestro Electron application source/build tree with desktop and CLI entry points; no root Git metadata."
+state = "archived"
+next_action = "Confirm the intended next use and retention role; keep source, evidence, and generated material distinguished."
+tags = ["xint"]
+
+[annotations]
+tags = []
+note = ""

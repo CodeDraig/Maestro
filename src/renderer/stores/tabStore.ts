@@ -1,0 +1,859 @@
+/**
+ * tabStore - Zustand store for tab operations and tab-specific UI state
+ *
+ * Tab DATA (aiTabs, filePreviewTabs, unifiedTabOrder, etc.) lives inside Session
+ * objects in sessionStore. This store provides:
+ *
+ * 1. Tab operation actions - wrap tabHelpers pure functions + sessionStore mutations,
+ *    replacing ~43 callbacks currently threaded through App.tsx props
+ * 2. Tab-specific UI state - gist content/URLs (the only tab state still in App.tsx)
+ * 3. Selectors - derived tab state (activeTab, activeFileTab, unifiedTabs)
+ *
+ * Why tab data stays in sessionStore:
+ * - Tab arrays are deeply embedded in the Session type (200+ call sites)
+ * - Each session owns its own set of AI and file preview tabs
+ * - tabHelpers functions take Session → return modified Session
+ * - Extracting tab data would be a massive, risky migration
+ *
+ * Instead, tabStore acts as a focused action layer over sessionStore,
+ * giving components a clean API without prop-drilling 43 callbacks.
+ *
+ * Migration path:
+ * 1. [CURRENT] Create tabStore with actions + UI state + selectors
+ * 2. [NEXT] Migrate App.tsx tab callbacks to use tabStore actions
+ * 3. [FUTURE] Components call tabStore directly, eliminating prop drilling
+ */
+
+import { create } from 'zustand';
+import { nextThinkingMode } from '../../shared/types';
+import type {
+	AITab,
+	FilePreviewTab,
+	Session,
+	LogEntry,
+	SnoozeContent,
+	SnoozedTabEntry,
+} from '../types';
+import type { GistInfo } from '../components/GistPublishModal';
+import {
+	createTab as createTabHelper,
+	closeTab as closeTabHelper,
+	closeFileTab as closeFileTabHelper,
+	setActiveTab as setActiveTabHelper,
+	navigateToNextUnifiedTab as navigateToNextHelper,
+	navigateToPrevUnifiedTab as navigateToPrevHelper,
+	navigateToUnifiedTabByIndex as navigateToIndexHelper,
+	navigateToLastUnifiedTab as navigateToLastHelper,
+	toggleReadOnlyModeFields,
+	type CreateTabOptions,
+	type CreateTabResult,
+	type CloseTabOptions,
+	type CloseTabResult,
+	type CloseFileTabResult,
+	type ReopenUnifiedClosedTabResult,
+	type SetActiveTabResult,
+	type NavigateToUnifiedTabResult,
+} from '../utils/tabHelpers';
+import {
+	createTerminalTab as createTerminalTabHelper,
+	addTerminalTab as addTerminalTabHelper,
+	closeTerminalTab as closeTerminalTabHelper,
+	selectTerminalTab as selectTerminalTabHelper,
+	restartTerminalTab as restartTerminalTabHelper,
+	renameTerminalTab as renameTerminalTabHelper,
+	setTerminalTabStartupCommand as setTerminalTabStartupCommandHelper,
+	getTerminalSessionId,
+} from '../utils/terminalTabHelpers';
+import { useSessionStore, selectActiveSession, updateSessionWith } from './sessionStore';
+import {
+	renameGroup as renameGroupHelper,
+	setGroupEmoji as setGroupEmojiHelper,
+	reopenClosedTabWithTiling as reopenUnifiedClosedTabHelper,
+} from '../utils/panelLayout';
+import {
+	snoozeTab as snoozeTabHelper,
+	snoozeTabGroup as snoozeTabGroupHelper,
+	wakeSnoozedTabGroup as wakeSnoozedTabGroupHelper,
+	isSnoozedGroup as isSnoozedGroupHelper,
+	wakeSnoozedTab as wakeSnoozedTabHelper,
+	removeSnoozedTab as removeSnoozedTabHelper,
+	updateSnoozedTab as updateSnoozedTabHelper,
+	type WakeSnoozedTabResult,
+} from '../utils/snoozeHelpers';
+import { runSnoozeWakePrompt } from '../services/snoozeWakePrompt';
+import { logger } from '../utils/logger';
+
+/**
+ * Why a terminal tab is being closed. Logged at every close site so a vanished
+ * terminal can be explained from the logs instead of guessed at. 'user-action'
+ * covers the X button, middle-click, overlay menu, and close-others/left/right.
+ */
+export type TerminalCloseReason =
+	| 'user-action'
+	| 'pty-exit'
+	| 'spawn-failure'
+	| 'close-others'
+	| 'close-left'
+	| 'close-right';
+
+// ============================================================================
+// Store Types
+// ============================================================================
+
+export interface TabStoreState {
+	// Gist publishing state (moved from App.tsx local state)
+	tabGistContent: {
+		filename: string;
+		content: string;
+		messageId?: string;
+		/**
+		 * Absolute path of the file the content came from, when the publish
+		 * started on a file preview tab. The published URL is recorded against
+		 * it so the file reads as published afterwards.
+		 */
+		filePath?: string;
+		/**
+		 * Raw log entries that produced `content`. When present, the publish modal
+		 * can re-format the body (e.g. to opt in to reasoning/thinking blocks)
+		 * without going back through the caller.
+		 */
+		sourceLogs?: LogEntry[];
+	} | null;
+	fileGistUrls: Record<string, GistInfo>;
+	/**
+	 * Pending terminal buffer content queued for "Send to Agent".
+	 * When set, the shared handleSendToAgent handler uses this buffer text as the
+	 * transferred message body instead of extracting logs from the active AI tab.
+	 * Cleared once the transfer completes or the SendToAgent modal is closed.
+	 */
+	pendingTerminalBufferSend: { content: string; sourceName: string } | null;
+}
+
+export interface TabStoreActions {
+	// === Gist UI state ===
+
+	setTabGistContent: (content: TabStoreState['tabGistContent']) => void;
+	setPendingTerminalBufferSend: (pending: { content: string; sourceName: string } | null) => void;
+	setFileGistUrls: (urls: Record<string, GistInfo>) => void;
+	setFileGistUrl: (path: string, info: GistInfo) => void;
+	clearFileGistUrl: (path: string) => void;
+
+	// === Tab CRUD (wraps tabHelpers + sessionStore) ===
+
+	/**
+	 * Create a new AI tab in the active session.
+	 * Wraps tabHelpers.createTab + updates sessionStore.
+	 */
+	createTab: (options?: CreateTabOptions) => CreateTabResult | null;
+
+	/**
+	 * Close an AI tab in the active session.
+	 * Wraps tabHelpers.closeTab + updates sessionStore.
+	 */
+	closeTab: (tabId: string, options?: CloseTabOptions) => CloseTabResult | null;
+
+	/**
+	 * Close a file preview tab in the active session.
+	 * Wraps tabHelpers.closeFileTab + updates sessionStore.
+	 */
+	closeFileTab: (tabId: string) => CloseFileTabResult | null;
+
+	/**
+	 * Reopen the most recently closed tab (AI or file) in the active session.
+	 * Wraps tabHelpers.reopenUnifiedClosedTab + updates sessionStore.
+	 */
+	reopenClosedTab: () => ReopenUnifiedClosedTabResult | null;
+
+	// === Tab navigation ===
+
+	/**
+	 * Set the active AI tab in the active session.
+	 * Wraps tabHelpers.setActiveTab + updates sessionStore.
+	 */
+	selectTab: (tabId: string) => SetActiveTabResult | null;
+
+	/**
+	 * Set the active file preview tab in the active session.
+	 * Updates session's activeFileTabId directly.
+	 */
+	selectFileTab: (tabId: string) => void;
+
+	/**
+	 * Navigate to the next tab in unified order.
+	 * @param showUnreadOnly - If true, only navigate through unread tabs
+	 */
+	navigateToNext: (showUnreadOnly?: boolean) => NavigateToUnifiedTabResult | null;
+
+	/**
+	 * Navigate to the previous tab in unified order.
+	 * @param showUnreadOnly - If true, only navigate through unread tabs
+	 */
+	navigateToPrev: (showUnreadOnly?: boolean) => NavigateToUnifiedTabResult | null;
+
+	/**
+	 * Navigate to a tab by its position in the unified tab order.
+	 * @param showUnreadOnly - If true, index into the unread-filtered visible tabs (matches tab bar)
+	 */
+	navigateToIndex: (index: number, showUnreadOnly?: boolean) => NavigateToUnifiedTabResult | null;
+
+	/**
+	 * Navigate to the last tab in unified order.
+	 * @param showUnreadOnly - If true, go to the last tab in the unread-filtered visible list
+	 */
+	navigateToLast: (showUnreadOnly?: boolean) => NavigateToUnifiedTabResult | null;
+
+	// === Tab metadata ===
+
+	/**
+	 * Toggle the starred flag on an AI tab.
+	 */
+	starTab: (tabId: string) => void;
+
+	/**
+	 * Set the hasUnread flag on an AI tab.
+	 */
+	markUnread: (tabId: string, unread?: boolean) => void;
+
+	/**
+	 * Update the name of an AI tab.
+	 */
+	updateTabName: (tabId: string, name: string | null) => void;
+
+	/**
+	 * Rename a tiled tab group (the group chip). Extends the tab-rename path to the
+	 * `'group'` ref: trims the input and falls back to `fallbackName` (the group's
+	 * auto-generated name) when the result is empty, so clearing the field never
+	 * leaves an unnamed chip. Persisted via updateSessionWith.
+	 */
+	renameGroup: (groupId: string, name: string, fallbackName: string) => void;
+
+	/**
+	 * Set the emoji shown on a tiled tab group's chip. An empty string clears it
+	 * back to the default grid glyph. Persisted via updateSessionWith.
+	 */
+	setGroupEmoji: (groupId: string, emoji: string) => void;
+
+	/**
+	 * Snooze a tab (or tiled group) until `wakeAt`, with an optional note
+	 * surfaced in the wake notification and an optional prompt run the moment it
+	 * returns. The tab leaves the tab bar until useSnoozeScheduler brings it
+	 * back.
+	 *
+	 * `sessionId` defaults to the active agent, which is what every click path
+	 * means - the user is snoozing the tab in front of them. It is explicit for
+	 * a caller that is not the user at the keyboard (`maestro-cli snooze`), where
+	 * "active" is whatever agent the human happens to be looking at and would
+	 * park the wrong tab.
+	 *
+	 * @returns The stored snooze entry, or null if the tab wasn't found
+	 */
+	snoozeTab: (
+		tabId: string,
+		wakeAt: number,
+		content?: SnoozeContent,
+		showUnreadOnly?: boolean,
+		sessionId?: string
+	) => SnoozedTabEntry | null;
+
+	/**
+	 * Restore a snoozed tab immediately, clearing its snooze. Works on any
+	 * session so the Snoozed Tabs list can act across agents.
+	 */
+	unsnoozeTab: (sessionId: string, snoozeId: string) => WakeSnoozedTabResult | null;
+
+	/**
+	 * Discard a snooze without restoring its tab.
+	 */
+	dismissSnoozedTab: (sessionId: string, snoozeId: string) => void;
+
+	/**
+	 * Reschedule a snooze. Each field of `content` that is present rewrites its
+	 * value (empty string clears it); an omitted field is left alone.
+	 */
+	rescheduleSnoozedTab: (
+		sessionId: string,
+		snoozeId: string,
+		wakeAt: number,
+		content?: SnoozeContent
+	) => void;
+
+	/**
+	 * Toggle read-only mode on an AI tab.
+	 */
+	toggleReadOnly: (tabId: string) => void;
+
+	/**
+	 * Toggle saveToHistory flag on an AI tab.
+	 */
+	toggleSaveToHistory: (tabId: string) => void;
+
+	/**
+	 * Cycle through thinking modes: off → on → sticky → off.
+	 */
+	cycleThinkingMode: (tabId: string) => void;
+
+	/**
+	 * Set per-tab model override. Pass undefined to clear and fall back to session/agent default.
+	 */
+	setTabModel: (tabId: string, model: string | undefined) => void;
+
+	/**
+	 * Set per-tab effort/reasoning override. Pass undefined to clear and fall back to session/agent default.
+	 */
+	setTabEffort: (tabId: string, effort: string | undefined) => void;
+
+	// === AI tab transcript scroll position ===
+
+	/**
+	 * Remember how far an AI tab's transcript is scrolled, so reopening it lands
+	 * where the user left off.
+	 */
+	setAiTabScrollTop: (tabId: string, scrollTop: number) => void;
+
+	/**
+	 * Record whether an AI tab's transcript is pinned to the bottom. Reaching the
+	 * bottom also clears the tab's unread flag - the user has now seen the tail,
+	 * which is the whole thing the badge was pointing at.
+	 */
+	setAiTabAtBottom: (tabId: string, isAtBottom: boolean) => void;
+
+	// === Tab reordering ===
+
+	/**
+	 * Reorder AI tabs within the active session.
+	 * Moves tab from fromIndex to toIndex in the aiTabs array.
+	 */
+	reorderTabs: (fromIndex: number, toIndex: number) => void;
+
+	/**
+	 * Reorder tabs in the unified tab order (AI + file tabs).
+	 * Moves tab from fromIndex to toIndex in unifiedTabOrder.
+	 */
+	reorderUnifiedTabs: (fromIndex: number, toIndex: number) => void;
+
+	// === Terminal tab CRUD ===
+
+	/**
+	 * Create a new terminal tab in the active session.
+	 * Switches inputMode to 'terminal' and sets activeTerminalTabId.
+	 */
+	createTerminalTab: (options?: { shell?: string; cwd?: string; name?: string | null }) => void;
+
+	/**
+	 * Close a terminal tab in the active session.
+	 * Kills the associated PTY process.
+	 *
+	 * @param reason - Why the tab is closing. Logged for diagnostics so a
+	 *   disappearing terminal can be traced to its cause. Defaults to 'user-action'.
+	 */
+	closeTerminalTab: (tabId: string, reason?: TerminalCloseReason) => void;
+
+	/**
+	 * Set the active terminal tab in the active session.
+	 * Switches inputMode to 'terminal'.
+	 */
+	selectTerminalTab: (tabId: string) => void;
+
+	/**
+	 * Restart an exited terminal tab in the active session.
+	 * Resets the tab to a spawnable state and selects it; the spawn effects in
+	 * TerminalView re-create the PTY (re-running any configured startup command).
+	 */
+	restartTerminalTab: (tabId: string) => void;
+
+	/**
+	 * Rename a terminal tab in the active session.
+	 */
+	renameTerminalTab: (tabId: string, name: string) => void;
+
+	/**
+	 * Configure the startup command (and optional cwd override) for a terminal tab
+	 * in a specific session. Pinned to sessionId rather than the active session so
+	 * the save lands correctly even if the user switches agents while the modal
+	 * is open.
+	 * Empty `command` clears the configuration.
+	 */
+	setTerminalTabStartupCommand: (
+		sessionId: string,
+		tabId: string,
+		command: string,
+		cwd: string
+	) => void;
+
+	// === File tab content operations ===
+
+	/**
+	 * Update the edit content of a file preview tab.
+	 */
+	updateFileTabEditContent: (tabId: string, content: string | undefined) => void;
+
+	/**
+	 * Update the scroll position of a file preview tab.
+	 */
+	updateFileTabScrollPosition: (tabId: string, scrollTop: number) => void;
+
+	/**
+	 * Update the search query of a file preview tab.
+	 */
+	updateFileTabSearchQuery: (tabId: string, query: string) => void;
+
+	/**
+	 * Toggle edit mode on a file preview tab.
+	 */
+	toggleFileTabEditMode: (tabId: string) => void;
+
+	/**
+	 * Set edit mode on a file preview tab to an explicit value. FilePreview's
+	 * setMarkdownEditMode expects a boolean setter (not a toggle), so tiled panes -
+	 * which drive the store directly rather than through the active-tab handlers -
+	 * use this to enter/leave edit mode.
+	 */
+	setFileTabEditMode: (tabId: string, editMode: boolean) => void;
+
+	/**
+	 * Set or clear the preview tier override on a file preview tab.
+	 * Pass `undefined` to clear and fall back to the auto-tier from
+	 * `pickPreviewTier`. Pass a concrete tier to force it.
+	 */
+	setFileTabPreviewTier: (tabId: string, tier: 'rich' | 'fast' | 'giant' | undefined) => void;
+
+	/**
+	 * Toggle whether an HTML file preview tab renders the document in an
+	 * iframe (true) or shows source (false). No-op for non-HTML files since
+	 * the Globe button is only surfaced for `.html` / `.htm`.
+	 */
+	setFileTabHtmlRenderMode: (tabId: string, value: boolean) => void;
+	/** Clear the transient deep-link line jump after FilePreview has consumed it. */
+	clearFileTabPendingScrollToLine: (tabId: string) => void;
+}
+
+export type TabStore = TabStoreState & TabStoreActions;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Get the active session from sessionStore.
+ * Returns null if no active session exists.
+ */
+function getActiveSession(): Session | null {
+	return selectActiveSession(useSessionStore.getState());
+}
+
+/**
+ * Update the active session in sessionStore with a modified session.
+ * Uses setSessions with a map to replace the session by ID.
+ */
+function updateActiveSession(updatedSession: Session): void {
+	const { activeSessionId } = useSessionStore.getState();
+	useSessionStore
+		.getState()
+		.setSessions((prev) => prev.map((s) => (s.id === activeSessionId ? updatedSession : s)));
+}
+
+/**
+ * Update a specific AI tab within the active session.
+ * More efficient than full session replacement for single-tab updates.
+ */
+function updateAiTab(tabId: string, updates: Partial<AITab>): void {
+	const { activeSessionId } = useSessionStore.getState();
+	useSessionStore.getState().setSessions((prev) =>
+		prev.map((s) => {
+			if (s.id !== activeSessionId) return s;
+			const tabIndex = s.aiTabs.findIndex((t) => t.id === tabId);
+			if (tabIndex === -1) return s;
+			const newTabs = [...s.aiTabs];
+			newTabs[tabIndex] = { ...newTabs[tabIndex], ...updates };
+			return { ...s, aiTabs: newTabs };
+		})
+	);
+}
+
+/**
+ * Update a specific file preview tab within the active session.
+ */
+function updateFileTab(tabId: string, updates: Partial<FilePreviewTab>): void {
+	const { activeSessionId } = useSessionStore.getState();
+	useSessionStore.getState().setSessions((prev) =>
+		prev.map((s) => {
+			if (s.id !== activeSessionId) return s;
+			const tabIndex = s.filePreviewTabs.findIndex((t) => t.id === tabId);
+			if (tabIndex === -1) return s;
+			const newTabs = [...s.filePreviewTabs];
+			newTabs[tabIndex] = { ...newTabs[tabIndex], ...updates };
+			return { ...s, filePreviewTabs: newTabs };
+		})
+	);
+}
+
+// ============================================================================
+// Store Implementation
+// ============================================================================
+
+export const useTabStore = create<TabStore>()((set) => ({
+	// --- State ---
+	tabGistContent: null,
+	fileGistUrls: {},
+	pendingTerminalBufferSend: null,
+
+	// --- Actions ---
+
+	// Gist UI state
+	setTabGistContent: (content) => set({ tabGistContent: content }),
+
+	setPendingTerminalBufferSend: (pending) => set({ pendingTerminalBufferSend: pending }),
+
+	setFileGistUrls: (urls) => set({ fileGistUrls: urls }),
+
+	setFileGistUrl: (path, info) =>
+		set((s) => ({
+			fileGistUrls: { ...s.fileGistUrls, [path]: info },
+		})),
+
+	clearFileGistUrl: (path) =>
+		set((s) => {
+			const { [path]: _, ...rest } = s.fileGistUrls;
+			return { fileGistUrls: rest };
+		}),
+
+	// Tab CRUD
+	createTab: (options?) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = createTabHelper(session, options);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	closeTab: (tabId, options?) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const showUnreadOnly = false; // Caller can pass showUnreadOnly via closeTab options if needed
+		const result = closeTabHelper(session, tabId, showUnreadOnly, options);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	closeFileTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = closeFileTabHelper(session, tabId);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	reopenClosedTab: () => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = reopenUnifiedClosedTabHelper(session);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	// Tab navigation
+	selectTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = setActiveTabHelper(session, tabId);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	selectFileTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		// Verify the file tab exists
+		if (!session.filePreviewTabs.some((t) => t.id === tabId)) return;
+		updateActiveSession({
+			...session,
+			activeFileTabId: tabId,
+			activeBrowserTabId: null,
+			activeTerminalTabId: null,
+			inputMode: 'ai',
+		});
+	},
+
+	navigateToNext: (showUnreadOnly?) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = navigateToNextHelper(session, showUnreadOnly);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	navigateToPrev: (showUnreadOnly?) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = navigateToPrevHelper(session, showUnreadOnly);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	navigateToIndex: (index, showUnreadOnly) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = navigateToIndexHelper(session, index, showUnreadOnly);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	navigateToLast: (showUnreadOnly) => {
+		const session = getActiveSession();
+		if (!session) return null;
+		const result = navigateToLastHelper(session, showUnreadOnly);
+		if (!result) return null;
+		updateActiveSession(result.session);
+		return result;
+	},
+
+	// Tab metadata
+	starTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = session.aiTabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		updateAiTab(tabId, { starred: !tab.starred });
+	},
+
+	markUnread: (tabId, unread = true) => updateAiTab(tabId, { hasUnread: unread }),
+
+	updateTabName: (tabId, name) => updateAiTab(tabId, { name }),
+
+	renameGroup: (groupId, name, fallbackName) => {
+		const session = getActiveSession();
+		if (!session) return;
+		updateSessionWith(session.id, (s) => renameGroupHelper(s, groupId, name, fallbackName));
+	},
+
+	setGroupEmoji: (groupId, emoji) => {
+		const session = getActiveSession();
+		if (!session) return;
+		updateSessionWith(session.id, (s) => setGroupEmojiHelper(s, groupId, emoji));
+	},
+
+	// Snooze - see utils/snoozeHelpers.ts for why snoozed tabs leave aiTabs entirely
+	snoozeTab: (tabId, wakeAt, content, showUnreadOnly, sessionId) => {
+		const session = sessionId
+			? useSessionStore.getState().sessions.find((s) => s.id === sessionId)
+			: getActiveSession();
+		if (!session) return null;
+		// One id, two shapes: the tab strip hands this the id of whatever the user
+		// right-clicked, and a tiled group is not a tab. Resolve which it is here
+		// rather than making every caller (chip menu, tab menu, palette) ask.
+		const isGroup = (session.tabGroups || []).some((g) => g.id === tabId);
+		const result = isGroup
+			? snoozeTabGroupHelper(session, tabId, wakeAt, content)
+			: snoozeTabHelper(session, tabId, wakeAt, content, showUnreadOnly);
+		if (!result) return null;
+		// Written by id rather than through `updateActiveSession`, which keys on
+		// `activeSessionId`: a CLI snooze names its own agent, and that agent is
+		// usually not the one on screen.
+		updateSessionWith(session.id, () => result.session);
+		return result.entry;
+	},
+
+	unsnoozeTab: (sessionId, snoozeId) => {
+		const session = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
+		if (!session) return null;
+		// A group rebuilds a layout, so it takes the group entry point. Pulled back
+		// by hand, every member is restored: the user is watching, and dropping a
+		// pane silently here would be a worse surprise than a preview that errors.
+		const entry = (session.snoozedTabs || []).find((sn) => sn.id === snoozeId);
+		if (entry && isSnoozedGroupHelper(entry)) {
+			const grouped = wakeSnoozedTabGroupHelper(session, snoozeId);
+			if (!grouped) return null;
+			updateSessionWith(sessionId, () => grouped.session);
+			// The wake prompt is written against the tab COMING BACK, so pulling it
+			// back early counts. Every member was restored on this path, so nothing
+			// has to be excluded.
+			runSnoozeWakePrompt(sessionId, entry, grouped.groupId);
+			return {
+				session: grouped.session,
+				entry,
+				tabId: grouped.groupId,
+				wasDuplicate: grouped.wasDuplicate,
+			};
+		}
+		// 'unsnoozed': the user pulled this back early rather than it coming due.
+		const result = wakeSnoozedTabHelper(session, snoozeId, 'unsnoozed');
+		if (!result) return null;
+		updateSessionWith(sessionId, () => result.session);
+		runSnoozeWakePrompt(sessionId, result.entry, result.tabId);
+		return result;
+	},
+
+	dismissSnoozedTab: (sessionId, snoozeId) => {
+		updateSessionWith(sessionId, (session) => removeSnoozedTabHelper(session, snoozeId));
+	},
+
+	rescheduleSnoozedTab: (sessionId, snoozeId, wakeAt, content) => {
+		updateSessionWith(sessionId, (session) =>
+			updateSnoozedTabHelper(session, snoozeId, wakeAt, content)
+		);
+	},
+
+	toggleReadOnly: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = session.aiTabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		updateAiTab(tabId, toggleReadOnlyModeFields(tab));
+	},
+
+	toggleSaveToHistory: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = session.aiTabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		updateAiTab(tabId, { saveToHistory: !tab.saveToHistory });
+	},
+
+	cycleThinkingMode: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = session.aiTabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		updateAiTab(tabId, { showThinking: nextThinkingMode(tab.showThinking) });
+	},
+
+	setTabModel: (tabId, model) => {
+		updateAiTab(tabId, { customModel: model || undefined });
+	},
+
+	setTabEffort: (tabId, effort) => {
+		updateAiTab(tabId, { customEffort: effort || undefined });
+	},
+
+	setAiTabScrollTop: (tabId, scrollTop) => {
+		updateAiTab(tabId, { scrollTop });
+	},
+
+	setAiTabAtBottom: (tabId, isAtBottom) => {
+		// Only clear unread on the way to the bottom; scrolling away must not
+		// re-mark a tab the user already read.
+		updateAiTab(tabId, isAtBottom ? { isAtBottom, hasUnread: false } : { isAtBottom });
+	},
+
+	// Tab reordering
+	reorderTabs: (fromIndex, toIndex) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tabs = [...session.aiTabs];
+		if (fromIndex < 0 || fromIndex >= tabs.length) return;
+		if (toIndex < 0 || toIndex >= tabs.length) return;
+		const [moved] = tabs.splice(fromIndex, 1);
+		tabs.splice(toIndex, 0, moved);
+		updateActiveSession({ ...session, aiTabs: tabs });
+	},
+
+	reorderUnifiedTabs: (fromIndex, toIndex) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const order = [...session.unifiedTabOrder];
+		if (fromIndex < 0 || fromIndex >= order.length) return;
+		if (toIndex < 0 || toIndex >= order.length) return;
+		const [moved] = order.splice(fromIndex, 1);
+		order.splice(toIndex, 0, moved);
+		updateActiveSession({ ...session, unifiedTabOrder: order });
+	},
+
+	// Terminal tab CRUD
+	createTerminalTab: (options?) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = createTerminalTabHelper(options?.shell, options?.cwd, options?.name);
+		const updatedSession = addTerminalTabHelper(session, tab);
+		updateActiveSession({ ...updatedSession, inputMode: 'terminal' });
+	},
+
+	closeTerminalTab: (tabId, reason = 'user-action') => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = (session.terminalTabs || []).find((t) => t.id === tabId);
+		const updatedSession = closeTerminalTabHelper(session, tabId);
+		if (updatedSession === session) return; // Tab not found
+		// Diagnostic: record exactly why a terminal tab was removed. This is the
+		// single chokepoint for terminal-tab destruction, so this log explains every
+		// vanished terminal (especially the non-user-initiated 'pty-exit' path).
+		logger.info('Closing terminal tab', 'TerminalView', {
+			sessionId: session.id,
+			tabId,
+			reason,
+			pid: tab?.pid,
+			state: tab?.state,
+			exitCode: tab?.exitCode,
+			hasStartupCommand: !!tab?.startupCommand,
+			isRemote: !!(session.sessionSshRemoteConfig?.enabled || session.sshRemoteId),
+			ageMs: tab ? Date.now() - tab.createdAt : undefined,
+		});
+		// Kill the PTY process after confirming the tab will be removed
+		window.maestro.process.kill(getTerminalSessionId(session.id, tabId));
+		updateActiveSession(updatedSession);
+	},
+
+	selectTerminalTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const updatedSession = selectTerminalTabHelper(session, tabId);
+		updateActiveSession({ ...updatedSession, inputMode: 'terminal' });
+	},
+
+	restartTerminalTab: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const updatedSession = restartTerminalTabHelper(session, tabId);
+		if (updatedSession === session) return; // Tab not found
+		// Defensive: kill any lingering PTY for this tab before the spawn effects
+		// re-create it. On a clean exit the process map entry is already gone, so
+		// this is a no-op (and emits no exit event) in the common case.
+		window.maestro.process.kill(getTerminalSessionId(session.id, tabId));
+		updateActiveSession({ ...updatedSession, inputMode: 'terminal' });
+	},
+
+	renameTerminalTab: (tabId, name) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const updatedSession = renameTerminalTabHelper(session, tabId, name);
+		updateActiveSession(updatedSession);
+	},
+
+	setTerminalTabStartupCommand: (sessionId, tabId, command, cwd) => {
+		useSessionStore.getState().setSessions((prev) =>
+			prev.map((s) => {
+				if (s.id !== sessionId) return s;
+				const updated = setTerminalTabStartupCommandHelper(s, tabId, command, cwd);
+				return updated;
+			})
+		);
+	},
+
+	// File tab content operations
+	updateFileTabEditContent: (tabId, content) => updateFileTab(tabId, { editContent: content }),
+	updateFileTabScrollPosition: (tabId, scrollTop) => updateFileTab(tabId, { scrollTop }),
+	updateFileTabSearchQuery: (tabId, query) => updateFileTab(tabId, { searchQuery: query }),
+
+	toggleFileTabEditMode: (tabId) => {
+		const session = getActiveSession();
+		if (!session) return;
+		const tab = session.filePreviewTabs.find((t) => t.id === tabId);
+		if (!tab) return;
+		updateFileTab(tabId, { editMode: !tab.editMode });
+	},
+
+	setFileTabEditMode: (tabId, editMode) => updateFileTab(tabId, { editMode }),
+
+	setFileTabPreviewTier: (tabId, tier) => updateFileTab(tabId, { previewTierOverride: tier }),
+
+	setFileTabHtmlRenderMode: (tabId, value) => updateFileTab(tabId, { htmlRenderMode: value }),
+	clearFileTabPendingScrollToLine: (tabId) =>
+		updateFileTab(tabId, { pendingScrollToLine: undefined }),
+}));

@@ -1,0 +1,338 @@
+/**
+ * createChatMarkdownComponents - the react-markdown component map for chat
+ * surfaces (AI Terminal, Group Chat, History, Feedback, Director's Notes,
+ * Document Graph). Moved out of MarkdownRenderer so the `<Markdown>` shell owns
+ * a single implementation while MarkdownRenderer becomes a thin wrapper.
+ *
+ * Chat-specific element styling lives here (scroll-wrapped tables, accentText
+ * links, Shiki code fences, IPC-loaded local images, bionify-aware prose). The
+ * genuinely shared leaf pieces (links, inline code, code fences) come from the
+ * Markdown/components/* modules, shared with the document factory.
+ */
+
+import React from 'react';
+import type { Components } from 'react-markdown';
+import type { ExtraProps } from 'react-markdown';
+import type { Theme } from '../../types';
+import { applyReadableTextTransforms } from '../../utils/markdownConfig';
+import { LocalImage } from './components/LocalImage';
+import { InlineCode } from './components/InlineCode';
+import { createMarkdownLink } from './components/MarkdownLink';
+import { createShikiCodeBlock } from './components/ShikiCodeBlock';
+import { AlertCallout } from './components/AlertCallout';
+import { FollowupChip } from './components/FollowupChip';
+import { CodexFileCitation } from './components/CodexFileCitation';
+import { CodexVisualizationFrame } from './components/CodexVisualizationFrame';
+import { CodeCommentCard } from './components/CodeCommentCard';
+import { GitActionCard, isGitDirectiveName } from './components/GitActionCard';
+import { alertTypeFromClassName } from './remarkAlert';
+import { readCodexDirectiveProps } from './remarkCodexDirectives';
+import { requestCodexFollowup } from '../../services/codexFollowup';
+
+export interface ChatMarkdownComponentsOptions {
+	theme: Theme;
+	/** Copy callback for code-fence copy buttons. */
+	onCopy: (text: string) => void;
+	/** Callback when an internal file link is clicked. */
+	onFileClick?: (path: string) => void;
+	/** Project root for resolving relative file paths (context menu). */
+	projectRoot?: string;
+	/** SSH remote ID for remote image loading. */
+	sshRemoteId?: string;
+	/** Bionify reading-mode emphasis (prose nodes only). */
+	enableBionifyReadingMode?: boolean;
+	bionifyIntensity?: number;
+	bionifyAlgorithm?: string;
+	/** Right-click handlers (owned by the shell so it can render the menus). */
+	onLinkContextMenu: (e: React.MouseEvent, url: string) => void;
+	onFileContextMenu: (e: React.MouseEvent, absPath: string, fileName: string) => void;
+	/**
+	 * Which conversation an ACTIONABLE directive belongs to - a `:codex-followup`
+	 * chip and the five `::git-*` actions. Present only where a Codex agent's own
+	 * message is being drawn, because that is the only place a directive is an
+	 * OFFER rather than text somebody typed. Absent leaves the directive as its
+	 * label, with no control to press.
+	 */
+	codexFollowup?: { sessionId: string; tabId: string };
+}
+
+export function createChatMarkdownComponents(
+	options: ChatMarkdownComponentsOptions
+): Partial<Components> {
+	const {
+		theme,
+		onCopy,
+		onFileClick,
+		projectRoot,
+		sshRemoteId,
+		enableBionifyReadingMode = false,
+		bionifyIntensity,
+		bionifyAlgorithm,
+		onLinkContextMenu,
+		onFileContextMenu,
+		codexFollowup,
+	} = options;
+
+	const withReadableTransforms = (children: React.ReactNode) =>
+		applyReadableTextTransforms(children, {
+			theme,
+			enableBionifyReadingMode,
+			bionifyIntensity,
+			bionifyAlgorithm,
+		});
+
+	// Chat link + code-fence renderers share the same leaf modules as the
+	// document path; chat behavior (accentText links, inline external handling,
+	// Shiki code fences, right-click context menus) is selected via config.
+	const ChatLink = createMarkdownLink({
+		theme,
+		linkColor: 'accentText',
+		projectRoot,
+		onFileClick,
+		onLinkContextMenu,
+		onFileContextMenu,
+		behavior: { directExternal: true },
+	});
+	const ChatCodeBlock = createShikiCodeBlock(theme, onCopy);
+
+	return {
+		a: ChatLink,
+		pre: ChatCodeBlock,
+		code: ({
+			node: _node,
+			className,
+			children,
+			style,
+			...props
+		}: JSX.IntrinsicElements['code'] & ExtraProps) => (
+			// Inline code only - block code is handled by the pre component above
+			<InlineCode className={className} style={style} passthrough={props}>
+				{children}
+			</InlineCode>
+		),
+		p: ({ node: _node, children, ...props }: JSX.IntrinsicElements['p'] & ExtraProps) => (
+			<p {...props}>{withReadableTransforms(children)}</p>
+		),
+		li: ({ node: _node, children, ...props }: JSX.IntrinsicElements['li'] & ExtraProps) => (
+			<li {...props}>{withReadableTransforms(children)}</li>
+		),
+		blockquote: ({
+			node: _node,
+			children,
+			className,
+			...props
+		}: JSX.IntrinsicElements['blockquote'] & ExtraProps) => {
+			// remarkAlert tags GitHub `[!NOTE]`-style blockquotes with a
+			// markdown-alert-<type> class; render those as styled callouts.
+			const alertType = alertTypeFromClassName(className);
+			if (alertType) {
+				return (
+					<AlertCallout type={alertType} theme={theme}>
+						{withReadableTransforms(children)}
+					</AlertCallout>
+				);
+			}
+			return (
+				<blockquote className={className} {...props}>
+					{withReadableTransforms(children)}
+				</blockquote>
+			);
+		},
+		h1: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h1'] & ExtraProps) => (
+			<h1 {...props}>{withReadableTransforms(children)}</h1>
+		),
+		h2: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h2'] & ExtraProps) => (
+			<h2 {...props}>{withReadableTransforms(children)}</h2>
+		),
+		h3: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h3'] & ExtraProps) => (
+			<h3 {...props}>{withReadableTransforms(children)}</h3>
+		),
+		h4: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h4'] & ExtraProps) => (
+			<h4 {...props}>{withReadableTransforms(children)}</h4>
+		),
+		h5: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h5'] & ExtraProps) => (
+			<h5 {...props}>{withReadableTransforms(children)}</h5>
+		),
+		h6: ({ node: _node, children, ...props }: JSX.IntrinsicElements['h6'] & ExtraProps) => (
+			<h6 {...props}>{withReadableTransforms(children)}</h6>
+		),
+		img: ({ node: _node, src, alt, ...props }: JSX.IntrinsicElements['img'] & ExtraProps) => {
+			// Use LocalImage component to handle file:// URLs via IPC.
+			// Extract width from data-maestro-width attribute if present.
+			const widthStr = (props as Record<string, unknown>)['data-maestro-width'] as
+				| string
+				| undefined;
+			const width = widthStr ? parseInt(widthStr, 10) : undefined;
+
+			return (
+				<LocalImage src={src} alt={alt} theme={theme} width={width} sshRemoteId={sshRemoteId} />
+			);
+		},
+		table: ({ node: _node, style, ...props }: JSX.IntrinsicElements['table'] & ExtraProps) => (
+			<div className="overflow-x-auto scrollbar-thin" style={{ maxWidth: '100%' }}>
+				<table
+					{...props}
+					style={{
+						minWidth: '100%',
+						borderCollapse: 'collapse',
+						...(style || {}),
+					}}
+				/>
+			</div>
+		),
+		th: ({ node: _node, style, children, ...props }: JSX.IntrinsicElements['th'] & ExtraProps) => (
+			<th
+				{...props}
+				style={{
+					padding: '8px 12px',
+					textAlign: 'left',
+					borderBottom: `1px solid ${theme.colors.border}`,
+					whiteSpace: 'nowrap',
+					...(style || {}),
+				}}
+			>
+				{withReadableTransforms(children)}
+			</th>
+		),
+		td: ({ node: _node, style, children, ...props }: JSX.IntrinsicElements['td'] & ExtraProps) => (
+			<td
+				{...props}
+				style={{
+					padding: '8px 12px',
+					borderBottom: `1px solid ${theme.colors.border}`,
+					wordWrap: 'break-word',
+					overflowWrap: 'break-word',
+					whiteSpace: 'normal',
+					verticalAlign: 'top',
+					...(style || {}),
+				}}
+			>
+				{withReadableTransforms(children)}
+			</td>
+		),
+		// Inline SVG diagrams (rehype-raw + sanitize let agents draw). The
+		// right-click Copy/Save menu comes from the app-wide delegated listener in
+		// ImageContextMenuHost, so nothing is wired here.
+		svg: ({ node: _node, children, ...props }: JSX.IntrinsicElements['svg'] & ExtraProps) => (
+			<svg {...props}>{children}</svg>
+		),
+		// Strip event handler attributes (e.g. onToggle) that rehype-raw may
+		// pass through as strings from AI-generated HTML, which React rejects.
+		// Fixes MAESTRO-8Q
+		details: ({
+			node: _node,
+			onToggle: _onToggle,
+			...props
+		}: JSX.IntrinsicElements['details'] & ExtraProps) => <details {...props} />,
+		/*
+		 * Codex assistant directives, tagged as spans by `remarkCodexDirectives`.
+		 *
+		 * Anything that is not a directive falls through to the plain span with its
+		 * children, which is what keeps the override inert on the rest of a
+		 * message: chat renders sanitized raw HTML, so an agent drawing its own
+		 * `<span>` must still get one.
+		 *
+		 * A directive with no chip behind it renders its LABEL as text. That is
+		 * two real cases - there is no `codexFollowup` context (nothing to click
+		 * into), or the name is one of the allowlist entries nothing draws yet -
+		 * and in both the plain span is NOT the right fallback: the plugin
+		 * deliberately emits no children, so returning it would render nothing at
+		 * all and delete the offer from the message. The label is the part the
+		 * agent wrote for a reader, which is the most the element still carries.
+		 */
+		span: ({ node: _node, children, ...props }: JSX.IntrinsicElements['span'] & ExtraProps) => {
+			const directive = readCodexDirectiveProps(props as Record<string, unknown>);
+			if (!directive) return <span {...props}>{children}</span>;
+
+			// A citation needs no conversation context: it points at a file and
+			// nothing else, so it draws wherever it appears. A path-less one falls
+			// through to its label, because a link to nowhere is not a link.
+			if (directive.name === 'codex-file-citation' && directive.attributes.path) {
+				return (
+					<CodexFileCitation
+						path={directive.attributes.path}
+						// Anything that is not literally `output` is read as a source.
+						// The hue and the hover text both claim the agent CHANGED this
+						// file, which a malformed attribute must not be able to assert.
+						purpose={directive.attributes.purpose === 'output' ? 'output' : 'source'}
+						artifactKind={directive.attributes.artifact_kind}
+						pageNumber={directive.attributes.page_number}
+						theme={theme}
+						LinkComponent={ChatLink}
+					/>
+				);
+			}
+
+			// Codex's `visualize` reference names an HTML fragment the agent just
+			// wrote. It renders the way the Codex app renders it: wrapped in
+			// Codex's own visualize kit and run in an isolated sandboxed frame,
+			// with the file chip as the fallback (see CodexVisualizationFrame).
+			if (directive.name === 'visualize' && directive.attributes.path) {
+				return (
+					<CodexVisualizationFrame
+						path={directive.attributes.path}
+						title={directive.attributes.title}
+						mode={directive.attributes.mode}
+						theme={theme}
+						LinkComponent={ChatLink}
+						conversation={codexFollowup}
+					/>
+				);
+			}
+
+			// A review comment is a statement about the code, not an offer, so it
+			// draws with no conversation context either. `body` is the one part
+			// that cannot be missing: a card with a title and no explanation says
+			// less than the label fallback below.
+			if (directive.name === 'code-comment' && directive.attributes.body) {
+				return (
+					<CodeCommentCard
+						title={directive.attributes.title}
+						body={directive.attributes.body}
+						file={directive.attributes.file}
+						start={directive.attributes.start}
+						end={directive.attributes.end}
+						priority={directive.attributes.priority}
+						theme={theme}
+						LinkComponent={ChatLink}
+					/>
+				);
+			}
+
+			// A git action is about ONE agent's repository, so it needs the same
+			// conversation context a follow-up does - without it there is no agent
+			// to act on, and the directive falls through to its label.
+			if (isGitDirectiveName(directive.name) && codexFollowup) {
+				return (
+					<GitActionCard
+						name={directive.name}
+						attributes={directive.attributes}
+						sessionId={codexFollowup.sessionId}
+						theme={theme}
+					/>
+				);
+			}
+
+			if (directive.name !== 'codex-followup' || !codexFollowup) {
+				return <span {...props}>{directive.label}</span>;
+			}
+
+			const { sessionId, tabId } = codexFollowup;
+			const prompt = directive.attributes.prompt ?? '';
+			return (
+				<FollowupChip
+					// The `[Label]` is optional in the grammar even though the bundled
+					// skills always emit one. Showing the prompt is the honest fallback:
+					// the alternative is a chip with nothing but an arrow on it, which
+					// says less about what a click does than the wire text did.
+					label={directive.label || prompt}
+					prompt={prompt}
+					sessionId={sessionId}
+					tabId={tabId}
+					theme={theme}
+					onActivate={(mode) => requestCodexFollowup({ prompt, sessionId, tabId, mode })}
+				/>
+			);
+		},
+	};
+}

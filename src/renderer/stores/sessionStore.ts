@@ -1,0 +1,562 @@
+/**
+ * sessionStore - Zustand store for centralized session and group state management
+ *
+ * All session, group, active session, bookmark, worktree tracking, and
+ * initialization states live here. Components subscribe to individual slices
+ * via selectors to avoid unnecessary re-renders.
+ *
+ * Key advantages:
+ * - Selector-based subscriptions: components only re-render when their slice changes
+ * - No refs needed: store.getState() gives current state anywhere
+ * - Works outside React: services and orchestrators can read/write store directly
+ *
+ * Can be used outside React via useSessionStore.getState() / useSessionStore.setState().
+ */
+
+import { create } from 'zustand';
+import type { Session, Group, LogEntry, AITab, FilePreviewTab, BrowserTab } from '../types';
+import { generateId } from '../utils/ids';
+import { getActiveTab } from '../utils/tabHelpers';
+import { hasRunnableQueueItem } from '../utils/executionQueue';
+import { logger } from '../utils/logger';
+import { persistActiveSessionId } from '../utils/activeSessionPersistence';
+import { useUIStore } from './uiStore';
+import {
+	normalizeGroupHierarchy,
+	removeGroupAndPromoteChildren,
+	setGroupParent as updateGroupParent,
+} from '../../shared/groupHierarchy';
+import { useContextTimelineStore } from './contextTimelineStore';
+import { forgetContextTimelineCaptures } from '../services/contextTimelineHydration';
+
+// ============================================================================
+// Store Types
+// ============================================================================
+
+export interface SessionStoreState {
+	// Core entities
+	sessions: Session[];
+	groups: Group[];
+
+	// Active session
+	activeSessionId: string;
+
+	// Initialization
+	sessionsLoaded: boolean;
+	initialLoadComplete: boolean;
+	initialFileTreeReady: boolean;
+
+	// True only once the group registry has been READ back successfully. Group
+	// persistence is gated on it, because an empty in-memory registry means two
+	// very different things - "this user has no groups" and "the registry could
+	// not be read" - and only the second must never be written to disk.
+	groupsLoaded: boolean;
+
+	// True only once the session registry has been READ back successfully.
+	// Distinct from `sessionsLoaded`, which is the splash-screen flag and is set
+	// in a `finally` whether or not the read worked. The flush in
+	// `useDebouncedPersistence` refuses to write while this is false, because
+	// the alternative is writing an unread (empty) tree over every agent.
+	sessionsReadOk: boolean;
+
+	// Worktree tracking (prevents re-discovery of manually removed worktrees)
+	removedWorktreePaths: Set<string>;
+
+	// Navigation cycling position (for Cmd+J/K session cycling)
+	cyclePosition: number;
+}
+
+export interface SessionStoreActions {
+	// === Session CRUD ===
+
+	/**
+	 * Set the sessions array. Supports both direct value and functional updater
+	 * to match React's setState signature (200+ call sites use the updater form).
+	 */
+	setSessions: (sessions: Session[] | ((prev: Session[]) => Session[])) => void;
+
+	/** Add a single session to the end of the list. */
+	addSession: (session: Session) => void;
+
+	/** Remove a session by ID. */
+	removeSession: (id: string) => void;
+
+	/**
+	 * Update a session by ID with a partial update.
+	 * More efficient than setSessions for single-session updates.
+	 */
+	updateSession: (id: string, updates: Partial<Session>) => void;
+
+	// === Active session ===
+
+	/**
+	 * Set the active session ID.
+	 * Resets cycle position (so next Cmd+J/K starts fresh).
+	 */
+	setActiveSessionId: (id: string) => void;
+
+	/**
+	 * Set the active session ID from persisted state on startup.
+	 * Updates local state only - does not write back to disk.
+	 */
+	hydrateActiveSessionId: (id: string) => void;
+
+	/**
+	 * Set the active session ID without resetting cycle position.
+	 * Used internally by session cycling (Cmd+J/K).
+	 */
+	setActiveSessionIdInternal: (id: string | ((prev: string) => string)) => void;
+
+	// === Groups ===
+
+	/**
+	 * Set the groups array. Supports both direct value and functional updater.
+	 */
+	setGroups: (groups: Group[] | ((prev: Group[]) => Group[])) => void;
+
+	/** Add a single group. */
+	addGroup: (group: Group) => void;
+
+	/** Remove a group by ID. */
+	removeGroup: (id: string) => void;
+
+	/** Update a group by ID with a partial update. */
+	updateGroup: (id: string, updates: Partial<Group>) => void;
+
+	/** Move a group to the top level or below a valid root group. */
+	setGroupParent: (groupId: string, parentGroupId: string | undefined) => void;
+
+	/** Toggle a group's collapsed state. */
+	toggleGroupCollapsed: (id: string) => void;
+
+	// === Initialization ===
+
+	setSessionsLoaded: (loaded: boolean | ((prev: boolean) => boolean)) => void;
+	setInitialLoadComplete: (complete: boolean | ((prev: boolean) => boolean)) => void;
+	setGroupsLoaded: (loaded: boolean | ((prev: boolean) => boolean)) => void;
+	setSessionsReadOk: (ok: boolean | ((prev: boolean) => boolean)) => void;
+	setInitialFileTreeReady: (ready: boolean | ((prev: boolean) => boolean)) => void;
+
+	// === Bookmarks ===
+
+	/** Toggle the bookmark flag on a session. */
+	toggleBookmark: (sessionId: string) => void;
+
+	// === Worktree tracking ===
+
+	/** Mark a worktree path as removed (prevents re-discovery during this session). */
+	addRemovedWorktreePath: (path: string) => void;
+
+	/** Replace the entire removed worktree paths set. */
+	setRemovedWorktreePaths: (paths: Set<string> | ((prev: Set<string>) => Set<string>)) => void;
+
+	// === Navigation ===
+
+	setCyclePosition: (pos: number) => void;
+	resetCyclePosition: () => void;
+
+	// === Log management ===
+
+	/**
+	 * Add a log entry to a specific tab's logs (or active tab if no tabId provided).
+	 * Used for slash commands, system messages, queued items, etc.
+	 */
+	addLogToTab: (
+		sessionId: string,
+		logEntry: Omit<LogEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: number },
+		tabId?: string
+	) => void;
+}
+
+export type SessionStore = SessionStoreState & SessionStoreActions;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Helper to resolve a value-or-updater argument, matching React's setState signature.
+ */
+function resolve<T>(valOrFn: T | ((prev: T) => T), prev: T): T {
+	return typeof valOrFn === 'function' ? (valOrFn as (prev: T) => T)(prev) : valOrFn;
+}
+
+// ============================================================================
+// Store Implementation
+// ============================================================================
+
+export const useSessionStore = create<SessionStore>()((set) => ({
+	// --- State ---
+	sessions: [],
+	groups: [],
+	activeSessionId: '',
+	sessionsLoaded: false,
+	initialLoadComplete: false,
+	initialFileTreeReady: false,
+	groupsLoaded: false,
+	sessionsReadOk: false,
+	removedWorktreePaths: new Set(),
+	cyclePosition: -1,
+
+	// --- Actions ---
+
+	// Session CRUD
+	setSessions: (v) =>
+		set((s) => {
+			const newSessions = resolve(v, s.sessions);
+			// Skip if same reference (no-op update)
+			if (newSessions === s.sessions) return s;
+			// Most delete flows (single-agent, group delete) filter the array and
+			// call setSessions directly rather than removeSession, so prune the
+			// context-timeline buffers of any agent that disappeared here. Guard on
+			// length so the common update path (same count) pays nothing.
+			if (newSessions.length < s.sessions.length) {
+				const liveIds = new Set(newSessions.map((sess) => sess.id));
+				for (const sess of s.sessions) {
+					if (!liveIds.has(sess.id)) {
+						useContextTimelineStore.getState().removeSession(sess.id);
+						forgetContextTimelineCaptures(sess.id);
+					}
+				}
+			}
+			return { sessions: newSessions };
+		}),
+
+	addSession: (session) => set((s) => ({ sessions: [...s.sessions, session] })),
+
+	removeSession: (id) =>
+		set((s) => {
+			const filtered = s.sessions.filter((session) => session.id !== id);
+			// Skip if nothing was removed
+			if (filtered.length === s.sessions.length) return s;
+			// Drop the deleted agent's context-timeline buffer so it doesn't leak,
+			// and main's raw capture log with it.
+			useContextTimelineStore.getState().removeSession(id);
+			forgetContextTimelineCaptures(id);
+			return { sessions: filtered };
+		}),
+
+	updateSession: (id, updates) =>
+		set((s) => {
+			let found = false;
+			const newSessions = s.sessions.map((session) => {
+				if (session.id === id) {
+					found = true;
+					return { ...session, ...updates };
+				}
+				return session;
+			});
+			// Skip if session not found
+			if (!found) return s;
+			return { sessions: newSessions };
+		}),
+
+	// Active session
+	setActiveSessionId: (id) => {
+		set({ activeSessionId: id, cyclePosition: -1 });
+		// Activating an agent through the public setter (clicks, external jumps)
+		// clears the Starred/Group-Chat keyboard cursor so a stale non-agent
+		// highlight never lingers. The cycle re-sets it afterward when it lands on
+		// a starred row (see useCycleSession.activateVisualItem).
+		useUIStore.getState().setSidebarExtraSelection(null);
+		// Fire-and-forget: persist for restore on next launch. Not awaited - UI
+		// state must update synchronously; if the write fails the only consequence
+		// is the session won't be pre-selected on next launch (falls back to first
+		// session). Routed through the helper because a web-desktop client keeps
+		// its own focused agent rather than sharing the desktop's.
+		persistActiveSessionId(id);
+	},
+
+	hydrateActiveSessionId: (id) => set({ activeSessionId: id, cyclePosition: -1 }),
+
+	setActiveSessionIdInternal: (v) =>
+		set((s) => ({ activeSessionId: resolve(v, s.activeSessionId) })),
+
+	// Groups
+	setGroups: (v) =>
+		set((s) => {
+			const newGroups = normalizeGroupHierarchy(resolve(v, s.groups));
+			if (newGroups === s.groups) return s;
+			return { groups: newGroups };
+		}),
+
+	addGroup: (group) =>
+		set((s) => ({
+			groups: normalizeGroupHierarchy([...s.groups, group]),
+		})),
+
+	removeGroup: (id) =>
+		set((s) => {
+			const groups = removeGroupAndPromoteChildren(s.groups, id);
+			if (groups.length === s.groups.length) return s;
+			return { groups };
+		}),
+
+	updateGroup: (id, updates) =>
+		set((s) => {
+			const hasParentGroupUpdate = Object.prototype.hasOwnProperty.call(updates, 'parentGroupId');
+			const { parentGroupId, ...otherUpdates } = updates;
+			const groupsWithParentUpdate = hasParentGroupUpdate
+				? updateGroupParent(s.groups, id, parentGroupId)
+				: s.groups;
+
+			if (Object.keys(otherUpdates).length === 0) {
+				return groupsWithParentUpdate === s.groups ? s : { groups: groupsWithParentUpdate };
+			}
+
+			let found = false;
+			const groups = groupsWithParentUpdate.map((group) => {
+				if (group.id === id) {
+					found = true;
+					return { ...group, ...otherUpdates };
+				}
+				return group;
+			});
+			if (!found) return s;
+			return { groups };
+		}),
+
+	setGroupParent: (groupId, parentGroupId) =>
+		set((s) => {
+			const groups = updateGroupParent(s.groups, groupId, parentGroupId);
+			return groups === s.groups ? s : { groups };
+		}),
+
+	toggleGroupCollapsed: (id) =>
+		set((s) => ({
+			groups: s.groups.map((g) => (g.id === id ? { ...g, collapsed: !g.collapsed } : g)),
+		})),
+
+	// Initialization
+	setSessionsLoaded: (v) => set((s) => ({ sessionsLoaded: resolve(v, s.sessionsLoaded) })),
+	setInitialLoadComplete: (v) =>
+		set((s) => ({ initialLoadComplete: resolve(v, s.initialLoadComplete) })),
+	setGroupsLoaded: (v) => set((s) => ({ groupsLoaded: resolve(v, s.groupsLoaded) })),
+	setSessionsReadOk: (v) => set((s) => ({ sessionsReadOk: resolve(v, s.sessionsReadOk) })),
+	setInitialFileTreeReady: (v) =>
+		set((s) => ({ initialFileTreeReady: resolve(v, s.initialFileTreeReady) })),
+
+	// Bookmarks
+	toggleBookmark: (sessionId) =>
+		set((s) => ({
+			sessions: s.sessions.map((session) =>
+				session.id === sessionId ? { ...session, bookmarked: !session.bookmarked } : session
+			),
+		})),
+
+	// Worktree tracking
+	addRemovedWorktreePath: (path) =>
+		set((s) => {
+			const newPaths = new Set(s.removedWorktreePaths);
+			newPaths.add(path);
+			return { removedWorktreePaths: newPaths };
+		}),
+
+	setRemovedWorktreePaths: (v) =>
+		set((s) => ({
+			removedWorktreePaths: resolve(v, s.removedWorktreePaths),
+		})),
+
+	// Navigation
+	setCyclePosition: (pos) => set({ cyclePosition: pos }),
+	resetCyclePosition: () => set({ cyclePosition: -1 }),
+
+	// Log management
+	addLogToTab: (sessionId, logEntry, tabId?) =>
+		set((s) => {
+			const entry: LogEntry = {
+				id: logEntry.id || generateId(),
+				timestamp: logEntry.timestamp || Date.now(),
+				source: logEntry.source,
+				text: logEntry.text,
+				...(logEntry.images && { images: logEntry.images }),
+				...(logEntry.delivered !== undefined && { delivered: logEntry.delivered }),
+				...('aiCommand' in logEntry && logEntry.aiCommand && { aiCommand: logEntry.aiCommand }),
+			};
+
+			const newSessions = s.sessions.map((session) => {
+				if (session.id !== sessionId) return session;
+
+				const targetTab = tabId
+					? session.aiTabs.find((tab) => tab.id === tabId)
+					: getActiveTab(session);
+
+				if (!targetTab) {
+					logger.error(
+						'[addLogToTab] No target tab found - session has no aiTabs, this should not happen'
+					);
+					return session;
+				}
+
+				return {
+					...session,
+					aiTabs: session.aiTabs.map((tab) =>
+						tab.id === targetTab.id ? { ...tab, logs: [...tab.logs, entry] } : tab
+					),
+				};
+			});
+
+			return { sessions: newSessions };
+		}),
+}));
+
+// ============================================================================
+// Selector Helpers
+// ============================================================================
+
+/**
+ * Select the active session object (derived from sessions + activeSessionId).
+ * Falls back to first session if activeSessionId doesn't match, then null.
+ *
+ * @example
+ * const activeSession = useSessionStore(selectActiveSession);
+ */
+export const selectActiveSession = (state: SessionStore): Session | null =>
+	state.sessions.find((s) => s.id === state.activeSessionId) || state.sessions[0] || null;
+
+/**
+ * Select a specific session by ID.
+ *
+ * @example
+ * const session = useSessionStore(selectSessionById('abc-123'));
+ */
+export const selectSessionById =
+	(id: string) =>
+	(state: SessionStore): Session | undefined =>
+		state.sessions.find((s) => s.id === id);
+
+export const selectIsAnySessionBusy = (state: SessionStore): boolean =>
+	state.sessions.some((s) => s.state === 'busy');
+
+/**
+ * Whether any agent still has queued work that would actually run.
+ *
+ * `busy` only means a turn is in flight RIGHT NOW, and the dequeue is atomic:
+ * `applyQueuedItemDispatch` flips the session to `busy` and drops the item from
+ * the queue in one update. So between two queued turns the agent is genuinely
+ * `idle` with the next item still sitting in `executionQueue`, and anything
+ * gating on busy alone reads that gap as "all work finished" - draining a
+ * five-item queue hits that gap four times.
+ *
+ * Paused items deliberately do NOT count as work: a held item keeps its position
+ * but is invisible to every dispatch path, so it can never start on its own and
+ * must not suppress an idle signal forever. That rule lives in
+ * `hasRunnableQueueItem`; do not re-derive `!item.paused` at a call site.
+ */
+export const selectHasAnyRunnableQueuedWork = (state: SessionStore): boolean =>
+	state.sessions.some((s) => hasRunnableQueueItem(s.executionQueue ?? []));
+
+// ============================================================================
+// Non-React Access
+// ============================================================================
+
+/**
+ * Update a session by ID using a mapper function.
+ * Convenience helper for call sites that need a full session → session transform
+ * rather than just a Partial<Session> update.
+ *
+ * Operates directly on the store outside of React - safe to call from callbacks.
+ *
+ * @example
+ * updateSessionWith(activeSession.id, (s) => ({ ...s, batchRunnerPrompt: prompt }));
+ */
+export function updateSessionWith(sessionId: string, updater: (session: Session) => Session): void {
+	useSessionStore
+		.getState()
+		.setSessions((prev: Session[]) => prev.map((s) => (s.id === sessionId ? updater(s) : s)));
+}
+
+/**
+ * Update a specific AI tab within a session using a mapper function.
+ * Convenience helper for tab-level updates that need a full tab → tab transform.
+ *
+ * Operates directly on the store outside of React - safe to call from callbacks.
+ *
+ * @example
+ * updateAiTab(sessionId, tabId, (tab) => ({ ...tab, autoSendOnActivate: false }));
+ */
+export function updateAiTab(
+	sessionId: string,
+	tabId: string,
+	updater: (tab: AITab) => AITab
+): void {
+	useSessionStore.getState().setSessions((prev: Session[]) =>
+		prev.map((s) => {
+			if (s.id !== sessionId) return s;
+			return {
+				...s,
+				aiTabs: s.aiTabs.map((t) => (t.id === tabId ? updater(t) : t)),
+			};
+		})
+	);
+}
+
+/**
+ * Update a specific file preview tab within a session using a mapper function.
+ * The file-tab counterpart to {@link updateAiTab}.
+ *
+ * Operates directly on the store outside of React - safe to call from callbacks.
+ *
+ * @example
+ * updateFileTab(sessionId, tabId, (tab) => ({ ...tab, scrollTop }));
+ */
+export function updateFileTab(
+	sessionId: string,
+	tabId: string,
+	updater: (tab: FilePreviewTab) => FilePreviewTab
+): void {
+	useSessionStore.getState().setSessions((prev: Session[]) =>
+		prev.map((s) => {
+			if (s.id !== sessionId) return s;
+			return {
+				...s,
+				filePreviewTabs: s.filePreviewTabs.map((t) => (t.id === tabId ? updater(t) : t)),
+			};
+		})
+	);
+}
+
+/**
+ * Update a specific browser tab within a session using a mapper function.
+ * The browser-tab counterpart to {@link updateAiTab}.
+ *
+ * Operates directly on the store outside of React - safe to call from callbacks.
+ *
+ * @example
+ * updateBrowserTab(sessionId, tabId, (tab) => ({ ...tab, isLoading: false }));
+ */
+export function updateBrowserTab(
+	sessionId: string,
+	tabId: string,
+	updater: (tab: BrowserTab) => BrowserTab
+): void {
+	useSessionStore.getState().setSessions((prev: Session[]) =>
+		prev.map((s) => {
+			if (s.id !== sessionId) return s;
+			return {
+				...s,
+				browserTabs: (s.browserTabs || []).map((t) => (t.id === tabId ? updater(t) : t)),
+			};
+		})
+	);
+}
+
+/**
+ * Prepend a tab's `pendingMergedContext` (set by merge, Send to Agent, and
+ * session-not-found recovery) to the prompt about to be spawned, and clear it
+ * so it is sent exactly once.
+ *
+ * Every spawn path must call this - the direct send AND the queue drain. A
+ * send that lands in the execution queue used to dispatch through
+ * `processQueuedItem`, which never read the context: the prompt went out bare
+ * and the context sat on the tab until some later, unrelated message.
+ *
+ * Reads the live store, so it is safe to call from async spawn code.
+ */
+export function takePendingMergedContext(sessionId: string, tabId: string, prompt: string): string {
+	const session = useSessionStore.getState().sessions.find((s) => s.id === sessionId);
+	const context = session?.aiTabs.find((t) => t.id === tabId)?.pendingMergedContext;
+	if (!context) return prompt;
+	updateAiTab(sessionId, tabId, (tab) => ({ ...tab, pendingMergedContext: undefined }));
+	return `${context}\n\n---\n\n${prompt}`;
+}

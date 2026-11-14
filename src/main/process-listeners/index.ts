@@ -1,0 +1,67 @@
+/**
+ * Process event listeners module.
+ * Handles all events emitted by ProcessManager and routes them appropriately.
+ *
+ * This module extracts the setupProcessListeners() logic from main/index.ts
+ * into smaller, focused modules for better maintainability.
+ */
+
+import type { ProcessManager } from '../process-manager';
+import type { ProcessListenerDependencies } from './types';
+
+// Import individual listener setup functions
+import { setupForwardingListeners } from './forwarding-listeners';
+import { setupDataListener } from './data-listener';
+import { setupGroupChatLivenessListener } from './group-chat-liveness-listener';
+import { setupUsageListener } from './usage-listener';
+import { setupSessionIdListener } from './session-id-listener';
+import { setupErrorListener } from './error-listener';
+import { setupExitListener } from './exit-listener';
+import { setupPluginEventListener } from './plugin-event-listener';
+import { setupDispatchCallbackListener } from './dispatch-callback-listener';
+
+// Re-export types for consumers
+export type { ProcessListenerDependencies, ParticipantInfo } from './types';
+
+/**
+ * Sets up all process event listeners.
+ * This is the main entry point that orchestrates all listener modules.
+ *
+ * @param processManager - The ProcessManager instance to attach listeners to
+ * @param deps - Dependencies for the listeners
+ */
+export function setupProcessListeners(
+	processManager: ProcessManager,
+	deps: ProcessListenerDependencies
+): void {
+	// Simple forwarding listeners (slash-commands, thinking-chunk, tool-execution, stderr, command-exit)
+	setupForwardingListeners(processManager, deps);
+
+	// Data output listener (with group chat buffering and web broadcast)
+	const { flushPendingData } = setupDataListener(processManager, deps);
+
+	// Re-arms the Group Chat router's per-turn silence budgets on any proof of life.
+	setupGroupChatLivenessListener(processManager);
+
+	// Usage statistics listener (with group chat participant/moderator updates)
+	setupUsageListener(processManager, deps);
+
+	// Session ID listener (with group chat participant/moderator storage)
+	setupSessionIdListener(processManager, deps);
+
+	// Agent error listener. Releases the data listener's coalesced output ahead
+	// of each error it forwards, so an error never reaches the renderer before
+	// the text it ends.
+	setupErrorListener(processManager, deps, flushPendingData);
+
+	// Exit listener (with group chat routing, recovery, and synthesis)
+	setupExitListener(processManager, deps);
+
+	// Plugin event-bus bridge: forwards metadata-only lifecycle events to plugins
+	// that hold events:subscribe (no-op when the plugin bus is not wired).
+	setupPluginEventListener(processManager, deps);
+
+	// dispatch --notify-on-complete: arm on the dispatched process's spawn, fire
+	// on its exit (no-op when no callbacks are armed).
+	setupDispatchCallbackListener(processManager);
+}

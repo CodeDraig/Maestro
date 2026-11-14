@@ -1,0 +1,5006 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
+/**
+ * Global type declarations for the renderer process.
+ * This file makes the window.maestro API available throughout the renderer.
+ */
+
+// Vite raw imports for .md files
+declare module '*.md?raw' {
+	const content: string;
+	export default content;
+}
+
+interface HTMLWebViewElement extends HTMLElement {
+	src: string;
+	partition: string;
+	canGoBack: () => boolean;
+	canGoForward: () => boolean;
+	goBack: () => void;
+	goForward: () => void;
+	reload: () => void;
+	stop: () => void;
+	getURL: () => string;
+	getTitle: () => string;
+	isLoading: () => boolean;
+	getWebContentsId?: () => number;
+}
+
+declare namespace JSX {
+	interface IntrinsicElements {
+		webview: React.DetailedHTMLProps<React.HTMLAttributes<HTMLElement>, HTMLElement> & {
+			allowpopups?: boolean | 'true' | 'false';
+			partition?: string;
+			src?: string;
+			useragent?: string;
+		};
+	}
+}
+
+type AutoRunTreeNode = {
+	name: string;
+	type: 'file' | 'folder';
+	path: string;
+	children?: AutoRunTreeNode[];
+};
+
+/** A node returned by `window.maestro.fs.readDirTree`. Matches `FileTreeNode`. */
+type LocalFileScanNode = {
+	name: string;
+	type: 'file' | 'folder';
+	children?: LocalFileScanNode[];
+};
+
+interface ProcessConfig {
+	sessionId: string;
+	toolType: string;
+	cwd: string;
+	command: string;
+	args: string[];
+	prompt?: string;
+	shell?: string;
+	images?: string[];
+	// Agent-specific spawn options (used to build args via agent config)
+	agentSessionId?: string;
+	readOnlyMode?: boolean;
+	modelId?: string;
+	yoloMode?: boolean;
+	permissionMode?: 'full' | 'standard' | 'readonly';
+	// Per-session overrides (take precedence over agent-level config)
+	sessionCustomPath?: string;
+	sessionCustomArgs?: string;
+	sessionCustomEnvVars?: Record<string, string>;
+	sessionCustomModel?: string;
+	sessionCustomEffort?: string;
+	sessionCustomContextWindow?: number;
+	// Session's Additional Directories. Providers that support it get native grant
+	// flags (--add-dir); all agents get the {{ADDITIONAL_DIRECTORIES}} prompt block.
+	sessionAdditionalDirectories?: import('../shared/types').AdditionalDirectory[];
+	// Per-session SSH remote config (takes precedence over agent-level SSH config)
+	sessionSshRemoteConfig?: {
+		enabled: boolean;
+		remoteId: string | null;
+		workingDirOverride?: string;
+		syncHistory?: boolean;
+	};
+	// System prompt delivery (separate from user message for token efficiency)
+	appendSystemPrompt?: string; // System prompt to pass via --append-system-prompt or embed in prompt
+	// NOTE: prompt delivery (argv vs stdin) is decided by the main process in
+	// handleProcessSpawn - it depends on the HOST platform and the agent's CLI,
+	// neither of which a renderer (possibly a browser on another OS) can know.
+	/** Who asked for this turn: a human ('user') or Auto Run ('auto'). Stamped into
+	 *  the spawned process env as MAESTRO_QUERY_SOURCE. Cue runs never come through
+	 *  this IPC path - they spawn in the main process and mark themselves 'cue'. */
+	querySource?: 'user' | 'auto';
+	// Claude token-source selection. Normally resolved server-side from the
+	// persisted session by sessionId, but spawns using a synthetic sessionId
+	// (e.g. background synopsis) forward these inline so the handler can resolve.
+	enableMaestroP?: boolean;
+	maestroPMode?: 'interactive' | 'dynamic';
+	maestroPPath?: string;
+	/** maestro-p idle cap (`--max-wait`) for a TUI turn. Unset keeps maestro-p's
+	 *  300s default; Auto Run raises it to its own inactivity budget. */
+	maestroPMaxWaitSeconds?: number;
+}
+
+type AgentConfigOption = import('../shared/types').AgentConfigOption;
+type AgentCapabilities = import('../shared/types').AgentCapabilities;
+type AgentConfig = import('../shared/types').AgentConfig;
+
+type DirectoryEntry = import('../shared/types').DirectoryEntry;
+type ShellInfo = import('../shared/types').ShellInfo;
+
+type UsageStats = import('../shared/types').UsageStats;
+
+type HistoryEntryType = import('../shared/types').HistoryEntryType;
+
+/**
+ * Result type for reading session messages from agent storage.
+ * Used by context merging operations.
+ */
+interface SessionMessagesResult {
+	messages: Array<{
+		type: string;
+		role?: string;
+		content: string;
+		timestamp: string;
+		uuid: string;
+		toolUse?: unknown;
+		/** Base64 data URLs reconstructed from image content blocks in the transcript. */
+		images?: string[];
+	}>;
+	total: number;
+	hasMore: boolean;
+}
+
+/** Shared return shape for group chat methods (mirrors GroupChat from shared/group-chat-types.ts) */
+type GroupChatData = {
+	id: string;
+	name: string;
+	createdAt: number;
+	updatedAt?: number;
+	moderatorAgentId: string;
+	moderatorSessionId: string;
+	moderatorAgentSessionId?: string;
+	moderatorConfig?: {
+		customPath?: string;
+		customArgs?: string;
+		customEnvVars?: Record<string, string>;
+		customModel?: string;
+		customEffort?: string;
+		sshRemoteConfig?: {
+			enabled: boolean;
+			remoteId: string | null;
+			workingDirOverride?: string;
+		};
+	};
+	participants: Array<{
+		name: string;
+		agentId: string;
+		sessionId: string;
+		agentSessionId?: string;
+		addedAt: number;
+		lastActivity?: number;
+		lastSummary?: string;
+		contextUsage?: number;
+		color?: string;
+		tokenCount?: number;
+		messageCount?: number;
+		processingTimeMs?: number;
+		totalCost?: number;
+		sshRemoteName?: string;
+	}>;
+	logPath: string;
+	imagesDir: string;
+	draftMessage?: string;
+	archived?: boolean;
+	requireIdleParticipants?: boolean;
+};
+
+import type { CueGraphSession, CueRunResult, CueSessionStatus, CueSettings } from '../shared/cue';
+import type { CueLogPayload } from '../shared/cue-log-types';
+import type { CueStatsAggregation, CueStatsTimeRange } from '../shared/cue-stats-types';
+import type { QueryEvent, StatsAggregation } from '../shared/stats-types';
+import type { MaestroCliStatus, MaestroCliInstallResult } from '../shared/maestro-cli';
+import type { DebugPackageOptions } from '../shared/debugPackage';
+import type {
+	ParquetFetchProgress,
+	ParquetFileInfo,
+	ParquetQueryRequest,
+	ParquetQueryResult,
+	ParquetSortSpec,
+} from '../shared/parquet/types';
+import type {
+	GitWorktreeSetupResult,
+	GitWorktreeCheckoutResult,
+	GitWorktreeRunSetupResult,
+	WorktreeSetupScriptContext,
+} from '../main/preload/git';
+import type { PianolaRule } from '../shared/pianola/types';
+import type {
+	PianolaDecisionRecord,
+	RulesLoadResult,
+	PianolaSupervisedTarget,
+	PianolaSuggestionsFile,
+} from '../shared/pianola/storage';
+import type { PianolaSupervisorSnapshot } from '../main/ipc/handlers/pianola';
+import type {
+	PluginListSnapshot,
+	PluginGrantsSnapshot,
+	PluginActivityMap,
+	PluginGroupingSnapshot,
+} from '../main/ipc/handlers/plugins';
+import type { InstallResult as PluginInstallResult } from '../main/plugins/plugin-manager';
+import type { AggregatedContributions as PluginContributions } from '../shared/plugins/contributions';
+import type { FirstPartyBridgeState } from '../main/plugins/first-party-bridge';
+import type { FirstPartyEncoreFlag } from '../shared/plugins/first-party';
+import type { AgentRunApi } from '../main/preload/agentRun';
+import type { BrowserOp } from '../shared/coworkingBrowser';
+import type { HistoryEntry } from '../shared/types';
+import type { SnoozeCommandRequest, SnoozeCommandResult } from '../shared/snoozeCommands';
+import type {
+	SteeringCommandRequest,
+	SteeringCommandResult,
+} from '../shared/autoRunSteeringCommands';
+import type { WindowCommandRequest, WindowCommandResult } from '../shared/windowCommands';
+import type { WebUserPublic } from '../shared/webLogin';
+
+interface MaestroAPI {
+	// Context merging API (for session context transfer and grooming)
+	context: {
+		getStoredSession: (
+			agentId: string,
+			projectRoot: string,
+			sessionId: string
+		) => Promise<SessionMessagesResult | null>;
+		// Single-call grooming: spawns a batch process and returns its response
+		groomContext: (
+			projectRoot: string,
+			agentType: string,
+			prompt: string,
+			options?: {
+				// SSH remote config for running grooming on a remote host
+				sshRemoteConfig?: {
+					enabled: boolean;
+					remoteId: string | null;
+					workingDirOverride?: string;
+				};
+				// Custom agent configuration
+				customPath?: string;
+				customArgs?: string;
+				customEnvVars?: Record<string, string>;
+				// Run this turn at the bottom of the model/effort ladders. Set it for
+				// summarization, whose output a human reads once. Do NOT set it for
+				// grooming or transfer - their output becomes the context every later
+				// turn reads, so a cheap compaction compounds silently.
+				cheapTurn?: boolean;
+				// The agent's Claude token source: a TUI agent runs this turn through maestro-p.
+				claudeTokenSource?: import('../shared/claudeTokenMode').ClaudeTokenSourceFields;
+			}
+		) => Promise<string>;
+		// Cancel all active grooming sessions
+		cancelGrooming: () => Promise<void>;
+	};
+	settings: {
+		get: (key: string) => Promise<unknown>;
+		set: (key: string, value: unknown) => Promise<boolean>;
+		getAll: () => Promise<Record<string, unknown>>;
+		onExternalChange: (handler: () => void) => () => void;
+	};
+	sessions: {
+		getAll: () => Promise<any[]>;
+		getBootstrap: () => Promise<any[]>;
+		getDeferredContent: (
+			sessionId: string,
+			tabId: string | null,
+			includeCommands: boolean
+		) => Promise<{
+			logs?: import('./types').LogEntry[];
+			shellLogs?: import('./types').LogEntry[];
+			agentCommands?: NonNullable<import('./types').Session['agentCommands']>;
+			aiCommandHistory?: string[];
+		}>;
+		setAll: (sessions: any[]) => Promise<boolean>;
+		/**
+		 * Incremental persistence: merge `updates` into the stored sessions and
+		 * remove any whose id is in `removeIds`. Preferred over `setAll` for
+		 * debounced flushes - avoids cloning + serializing the entire sessions
+		 * tree on every change.
+		 */
+		setMany: (updates: any[], removeIds?: string[]) => Promise<boolean>;
+		getActiveSessionId: () => Promise<string>;
+		setActiveSessionId: (id: string) => Promise<void>;
+		/**
+		 * Listen for main-side focus requests emitted by the plugin `sessions.focus`
+		 * verb. The renderer applies the jump through its canonical helpers because
+		 * the main-side store write is invisible to the live Zustand store.
+		 */
+		onFocusRequest: (
+			handler: (payload: { sessionId: string; tabId?: string }) => void
+		) => () => void;
+		/**
+		 * Listen for agents another client (a second desktop window, or a
+		 * web-desktop browser tab) added or closed, so this renderer's session list
+		 * follows along instead of only finding out on reload.
+		 */
+		onLifecycleSync: (
+			handler: (payload: { added: any[]; removedIds: string[] }) => void
+		) => () => void;
+	};
+	groups: {
+		getAll: () => Promise<any[]>;
+		setAll: (groups: any[]) => Promise<boolean>;
+	};
+	process: {
+		spawn: (config: ProcessConfig) => Promise<{ pid: number; success: boolean }>;
+		spawnTerminalTab: (config: {
+			sessionId: string;
+			cwd: string;
+			shell?: string;
+			shellArgs?: string;
+			shellEnvVars?: Record<string, string>;
+			toolType?: string;
+			sessionCustomEnvVars?: Record<string, string>;
+			cols?: number;
+			rows?: number;
+			sessionSshRemoteConfig?: {
+				enabled: boolean;
+				remoteId: string | null;
+				workingDirOverride?: string;
+				syncHistory?: boolean;
+			};
+		}) => Promise<{ pid: number; success: boolean }>;
+		write: (sessionId: string, data: string) => Promise<boolean>;
+		broadcastUserInput: (payload: {
+			originId: string;
+			sessionId: string;
+			tabId?: string;
+			inputMode: 'ai' | 'terminal';
+			entry: {
+				id: string;
+				timestamp: number;
+				source: 'user';
+				text: string;
+				images?: string[];
+				readOnly?: boolean;
+				forceParallel?: boolean;
+			};
+		}) => Promise<void>;
+		interrupt: (sessionId: string) => Promise<boolean>;
+		kill: (sessionId: string) => Promise<boolean>;
+		resize: (sessionId: string, cols: number, rows: number) => Promise<boolean>;
+		runCommand: (config: {
+			sessionId: string;
+			command: string;
+			cwd: string;
+			shell?: string;
+			sessionSshRemoteConfig?: {
+				enabled: boolean;
+				remoteId: string | null;
+				workingDirOverride?: string;
+				syncHistory?: boolean;
+			};
+		}) => Promise<{ exitCode: number }>;
+		/** Terminate an in-flight `runCommand`. False when nothing is running under that id. */
+		cancelCommand: (sessionId: string) => Promise<boolean>;
+		getActiveProcesses: (options?: { includeChildProcesses?: boolean }) => Promise<
+			Array<{
+				sessionId: string;
+				toolType: string;
+				pid: number;
+				cwd: string;
+				isTerminal: boolean;
+				isBatchMode: boolean;
+				startTime?: number;
+				command?: string;
+				args?: string[];
+				isCueRun?: boolean;
+				cueRunId?: string;
+				cueSessionName?: string;
+				cueSubscriptionName?: string;
+				cueEventType?: string;
+				childProcesses?: Array<{ pid: number; command: string }>;
+			}>
+		>;
+		isTerminalBusy: (sessionId: string) => Promise<boolean>;
+		onData: (callback: (sessionId: string, data: string) => void) => () => void;
+		onUserInput: (
+			callback: (payload: {
+				originId: string;
+				sessionId: string;
+				tabId?: string;
+				inputMode: 'ai' | 'terminal';
+				entry: {
+					id: string;
+					timestamp: number;
+					source: 'user';
+					text: string;
+					images?: string[];
+					readOnly?: boolean;
+					forceParallel?: boolean;
+				};
+			}) => void
+		) => () => void;
+		/** `signal` is set only when the process was killed by a signal, never on a clean exit. */
+		onExit: (callback: (sessionId: string, code: number, signal?: number) => void) => () => void;
+		onPermissionRequest: (
+			callback: (request: {
+				requestId: string;
+				sessionId: string;
+				tabId?: string;
+				toolName: string;
+				input: Record<string, unknown>;
+				createdAt: number;
+				kind?: 'question';
+				questions?: Array<{
+					question: string;
+					header?: string;
+					options: Array<{ label: string; description?: string }>;
+					multiSelect: boolean;
+				}>;
+			}) => void
+		) => () => void;
+		respondPermission: (
+			requestId: string,
+			decision:
+				| { behavior: 'allow'; updatedInput?: Record<string, unknown> }
+				| { behavior: 'deny'; message: string }
+		) => Promise<boolean>;
+		onSessionId: (callback: (sessionId: string, agentSessionId: string) => void) => () => void;
+		onSlashCommands: (callback: (sessionId: string, slashCommands: string[]) => void) => () => void;
+		onThinkingChunk: (callback: (sessionId: string, content: string) => void) => () => void;
+		onToolExecution: (
+			callback: (
+				sessionId: string,
+				toolEvent: { toolName: string; state?: unknown; timestamp: number }
+			) => void
+		) => () => void;
+		onSshRemote: (
+			callback: (
+				sessionId: string,
+				sshRemote: { id: string; name: string; host: string } | null
+			) => void
+		) => () => void;
+		onClaudeModeResolved: (
+			callback: (
+				sessionId: string,
+				resolution: {
+					mode: 'interactive' | 'api';
+					reason: 'auto' | 'limit';
+					configDirKey: string;
+				}
+			) => void
+		) => () => void;
+		onRemoteCommand: (
+			callback: (
+				sessionId: string,
+				command: string,
+				inputMode?: 'ai' | 'terminal',
+				tabId?: string,
+				force?: boolean,
+				images?: string[],
+				background?: boolean,
+				receiptChannel?: string
+			) => void
+		) => () => void;
+		/** Answer a `remote:executeCommand` receipt channel. `accepted: true`
+		 *  means the command reached the spawn/queue logic, not that it
+		 *  completed. Drives the CLI's `dispatch` success flag. */
+		sendRemoteCommandReceipt: (receiptChannel: string, accepted: boolean, reason?: string) => void;
+		onRemoteSwitchMode: (
+			callback: (sessionId: string, mode: 'ai' | 'terminal', background?: boolean) => void
+		) => () => void;
+		onRemoteInterrupt: (callback: (sessionId: string) => void) => () => void;
+		onRemoteSelectSession: (callback: (sessionId: string) => void) => () => void;
+		onRemoteSelectTab: (
+			callback: (
+				sessionId: string,
+				tabId: string,
+				aiTabs?: import('../main/web-server/types').AITabData[]
+			) => void
+		) => () => void;
+		onRemoteNewTab: (
+			callback: (sessionId: string, responseChannel: string, background?: boolean) => void
+		) => () => void;
+		sendRemoteNewTabResponse: (responseChannel: string, result: { tabId: string } | null) => void;
+		onRemoteCloseTab: (callback: (sessionId: string, tabId: string) => void) => () => void;
+		onRemoteRenameTab: (
+			callback: (sessionId: string, tabId: string, newName: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteRenameTabResponse: (
+			responseChannel: string,
+			result: { success: boolean; error?: string }
+		) => void;
+		onRemoteStarTab: (
+			callback: (sessionId: string, tabId: string, starred: boolean) => void
+		) => () => void;
+		onRemoteSnoozeCommand: (
+			callback: (request: SnoozeCommandRequest, responseChannel: string) => void
+		) => () => void;
+		sendRemoteSnoozeCommandResponse: (responseChannel: string, result: SnoozeCommandResult) => void;
+		onRemoteReorderTab: (
+			callback: (sessionId: string, fromIndex: number, toIndex: number) => void
+		) => () => void;
+		onRemoteToggleBookmark: (callback: (sessionId: string) => void) => () => void;
+		onRemoteOpenFileTab: (
+			callback: (
+				sessionId: string,
+				filePath: string,
+				options: {
+					background: boolean;
+					switchToAgent: boolean;
+					mediaMode: import('../shared/mediaTypes').MediaOpenMode;
+				}
+			) => void
+		) => () => void;
+		onRemoteNotificationInbox: (
+			callback: (
+				request: import('../shared/notificationInbox').NotificationInboxRequest
+			) =>
+				| import('../shared/notificationInbox').NotificationInboxResult
+				| Promise<import('../shared/notificationInbox').NotificationInboxResult>
+		) => () => void;
+		onRemoteOpenModal: (
+			callback: (params: { surface: string; tab?: string }) => void
+		) => () => void;
+		onRemoteOpenDocumentGraph: (
+			callback: (params: {
+				sessionId: string;
+				files?: string[];
+				directory?: string;
+				focusPath?: string;
+			}) => void
+		) => () => void;
+		onRemoteRefreshFileTree: (callback: (sessionId: string) => void) => () => void;
+		onRemoteNotifyToast: (
+			callback: (params: {
+				title: string;
+				message: string;
+				color: 'green' | 'yellow' | 'orange' | 'red' | 'theme';
+				duration?: number;
+				dismissible?: boolean;
+				sessionId?: string;
+				sourceAgent?: string;
+				tabId?: string;
+				actionUrl?: string;
+				actionLabel?: string;
+				clickAction?: import('../shared/toastClickAction').ToastClickAction;
+			}) => void
+		) => () => void;
+		onRemoteCadenza: (
+			callback: (params: {
+				op: 'open' | 'update' | 'close';
+				id: string;
+				viewType?:
+					| 'tracker'
+					| 'file'
+					| 'markdown'
+					| 'image'
+					| 'code'
+					| 'view'
+					| 'decision'
+					| 'html';
+				title?: string;
+				body?: string;
+				path?: string;
+				options?: Array<{ label: string; value: string }>;
+				color?: 'green' | 'yellow' | 'orange' | 'red' | 'theme';
+				sessionId?: string;
+			}) => void
+		) => () => void;
+		onRemoteCadenzaFlash: (callback: (id: string) => void) => () => void;
+		flashCadenza: (id: string) => void;
+		onRemoteCadenzaHidden: (callback: (hidden: boolean) => void) => () => void;
+		setCadenzasHidden: (hidden: boolean) => void;
+		onRemoteMovement: (
+			callback: (
+				params: {
+					op: 'begin' | 'add' | 'update' | 'move' | 'remove' | 'clear' | 'progress';
+					id?: string;
+					viewType?: 'view' | 'html';
+					x?: number;
+					y?: number;
+					width?: number;
+					height?: number;
+					title?: string;
+					body?: string;
+					sourcePlugin?: string;
+					revision?: number;
+					phase?: 'composing' | 'refining' | 'arranging' | 'reviewing' | 'testing';
+					step?: number;
+					steps?: number;
+					notes?: Array<{
+						value: 'quarter' | 'eighth' | 'sixteenth';
+						dotted?: boolean;
+						triad?: boolean;
+						tie?: boolean;
+					}>;
+				},
+				responseChannel?: string
+			) => void
+		) => () => void;
+		sendMovementAppliedResponse: (responseChannel: string, applied: boolean) => void;
+		releaseConcertoHtmlDocument: (surface: 'movement' | 'cadenza', id: string) => void;
+		restoreConcertoHtmlDocument: (
+			surface: 'movement' | 'cadenza',
+			id: string,
+			html: string
+		) => Promise<number>;
+		onRequestMovementState: (callback: (responseChannel: string) => void) => () => void;
+		sendMovementStateResponse: (responseChannel: string, snapshot: unknown) => void;
+		onRequestMovementDesignerInspection: (
+			callback: (id: string, expectedRevision: number, responseChannel: string) => void
+		) => () => void;
+		sendMovementDesignerInspectionResponse: (responseChannel: string, snapshot: unknown) => void;
+		onRequestMovementDesignerInteraction: (
+			callback: (
+				id: string,
+				action:
+					| { kind: 'click'; selector: string }
+					| { kind: 'type'; selector: string; value: string },
+				expectedRevision: number,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendMovementDesignerInteractionResponse: (responseChannel: string, result: unknown) => void;
+		notifyCadenzaHudReady: () => void;
+		setCadenzaHudCardRects: (
+			rects: Array<{ x: number; y: number; width: number; height: number }>
+		) => void;
+		openCadenzaFileTab: (sessionId: string, filePath: string) => void;
+		sendCadenzaDecision: (sessionId: string, message: string) => void;
+		onRemoteNotifyCenterFlash: (
+			callback: (params: {
+				message: string;
+				detail?: string;
+				color: 'green' | 'yellow' | 'orange' | 'red' | 'theme';
+				duration?: number;
+			}) => void
+		) => () => void;
+		onRemoteOpenBrowserTab: (
+			callback: (
+				sessionId: string,
+				url: string,
+				responseChannel: string,
+				options: { background?: boolean }
+			) => void
+		) => () => void;
+		sendRemoteOpenBrowserTabResponse: (
+			responseChannel: string,
+			success: boolean,
+			tabId?: string
+		) => void;
+		onRemoteCloseBrowserTab: (
+			callback: (tabId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteCloseBrowserTabResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteOpenTerminalTab: (
+			callback: (
+				sessionId: string,
+				config: { cwd?: string; shell?: string; name?: string | null; command?: string },
+				responseChannel: string,
+				options: { background?: boolean }
+			) => void
+		) => () => void;
+		sendRemoteOpenTerminalTabResponse: (
+			responseChannel: string,
+			success: boolean,
+			tabId?: string
+		) => void;
+		onRemoteWriteTerminalTab: (
+			callback: (
+				sessionId: string,
+				payload: { tabRef?: string; data: string },
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteWriteTerminalTabResponse: (
+			responseChannel: string,
+			success: boolean,
+			result?: { error?: string; tabId?: string; tabName?: string }
+		) => void;
+		onRemoteListTerminalTabs: (
+			callback: (sessionId: string | undefined, responseChannel: string) => void
+		) => () => void;
+		sendRemoteListTerminalTabsResponse: (responseChannel: string, tabs: unknown[]) => void;
+		onRemoteReadTerminalTab: (
+			callback: (
+				sessionId: string,
+				payload: { tabRef?: string; tail?: number },
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteReadTerminalTabResponse: (
+			responseChannel: string,
+			success: boolean,
+			result?: {
+				error?: string;
+				tabId?: string;
+				tabName?: string;
+				cwd?: string;
+				state?: string;
+				content?: string;
+				totalLines?: number;
+			}
+		) => void;
+		onRemoteGetGroupChats: (callback: (responseChannel: string) => void) => () => void;
+		sendRemoteGetGroupChatsResponse: (
+			responseChannel: string,
+			result: import('../shared/groupChatRemote').RemoteGroupChatState[]
+		) => void;
+		onRemoteStartGroupChat: (
+			callback: (
+				topic: string,
+				participantIds: string[],
+				responseChannel: string,
+				options?: { moderatorAgentId?: string; message?: string }
+			) => void
+		) => () => void;
+		sendRemoteStartGroupChatResponse: (
+			responseChannel: string,
+			result: { chatId?: string; error?: string } | null
+		) => void;
+		onRemoteGetGroupChatState: (
+			callback: (chatId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteGetGroupChatStateResponse: (
+			responseChannel: string,
+			result: import('../shared/groupChatRemote').RemoteGroupChatState | null
+		) => void;
+		onRemoteStopGroupChat: (
+			callback: (chatId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteStopGroupChatResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteSendGroupChatMessage: (
+			callback: (chatId: string, message: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteSendGroupChatMessageResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteNewAITabWithPrompt: (
+			callback: (
+				sessionId: string,
+				prompt: string,
+				responseChannel: string,
+				background?: boolean
+			) => void
+		) => () => void;
+		sendRemoteNewAITabWithPromptResponse: (
+			responseChannel: string,
+			result: { success: boolean; tabId?: string; queued?: boolean; error?: string }
+		) => void;
+		/** Cross-agent consult asked for over the CLI (`maestro-cli ask`). The
+		 *  reply is the consulted agent's ANSWER, so it can arrive minutes later. */
+		onRemoteCrossAgentAsk: (
+			callback: (
+				request: {
+					targetSessionId: string;
+					question: string;
+					fromSessionId?: string;
+					fromTabId?: string;
+					withContext?: boolean;
+				},
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteCrossAgentAskResponse: (
+			responseChannel: string,
+			result: {
+				success: boolean;
+				answer?: string;
+				error?: string;
+				canceled?: boolean;
+				targetAgentName?: string;
+				targetTabId?: string;
+			}
+		) => void;
+		/** A delivered `maestro-cli dispatch` that an agent ran from its own shell. */
+		onRemoteAgentDelegation: (
+			callback: (notice: import('../shared/agentDelegation').AgentDelegationNotice) => void
+		) => () => void;
+		onRemoteEnqueueCommand: (
+			callback: (
+				sessionId: string,
+				command: string,
+				responseChannel: string,
+				inputMode?: 'ai' | 'terminal',
+				tabId?: string,
+				images?: string[],
+				background?: boolean
+			) => void
+		) => () => void;
+		sendRemoteEnqueueCommandResponse: (
+			responseChannel: string,
+			result: {
+				success: boolean;
+				tabId?: string;
+				queued?: boolean;
+				queuePosition?: number;
+				queueLength?: number;
+				itemId?: string;
+				error?: string;
+				/** Machine-readable failure cause, so main can react to a specific one
+				 *  (dispatch callbacks retry agent-level on `tab-not-found`). */
+				reason?: 'session-not-found' | 'tab-not-found' | 'no-ai-tabs';
+			}
+		) => void;
+		onRemoteListQueue: (
+			callback: (sessionId: string | undefined, responseChannel: string) => void
+		) => () => void;
+		sendRemoteListQueueResponse: (
+			responseChannel: string,
+			result: { success: boolean; queues: unknown[]; error?: string }
+		) => void;
+		onRemoteRemoveQueueItem: (
+			callback: (sessionId: string, itemId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteRemoveQueueItemResponse: (
+			responseChannel: string,
+			result: { success: boolean; removed: boolean; error?: string }
+		) => void;
+		onRemoteRefreshAutoRunDocs: (
+			callback: (sessionId: string, background?: boolean) => void
+		) => () => void;
+		onRemoteConfigureAutoRun: (
+			callback: (
+				sessionId: string,
+				config: {
+					documents: Array<{ filename: string; resetOnCompletion?: boolean }>;
+					prompt?: string;
+					loopEnabled?: boolean;
+					maxLoops?: number;
+					saveAsPlaybook?: string;
+					launch?: boolean;
+				},
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteConfigureAutoRunResponse: (
+			responseChannel: string,
+			result: { success: boolean; playbookId?: string; error?: string }
+		) => void;
+		onRemoteLaunchGoalRun: (
+			callback: (
+				sessionId: string,
+				config: {
+					goal: string;
+					exitCriteria?: string;
+					maxIterations?: number | null;
+					model?: string;
+					effort?: string;
+				},
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteLaunchGoalRunResponse: (
+			responseChannel: string,
+			result: { success: boolean; tabId?: string; code?: string; error?: string }
+		) => void;
+		onRemoteCreateWorktreeSession: (
+			callback: (
+				parentSessionId: string,
+				config: {
+					branchName: string;
+					baseBranch?: string;
+				},
+				responseChannel: string,
+				background?: boolean
+			) => void
+		) => () => void;
+		sendRemoteCreateWorktreeSessionResponse: (
+			responseChannel: string,
+			result: { success: boolean; sessionId?: string; error?: string }
+		) => void;
+		onRemoteSetAutoRunFolder: (
+			callback: (sessionId: string, folderPath: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteSetAutoRunFolderResponse: (
+			responseChannel: string,
+			result: { success: boolean; error?: string }
+		) => void;
+		onRemoteGetAutoRunDocs: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteGetAutoRunDocsResponse: (responseChannel: string, documents: any[]) => void;
+		onRemoteGetAutoRunDocContent: (
+			callback: (sessionId: string, filename: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteGetAutoRunDocContentResponse: (responseChannel: string, content: string) => void;
+		onRemoteSaveAutoRunDoc: (
+			callback: (
+				sessionId: string,
+				filename: string,
+				content: string,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteSaveAutoRunDocResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteAutoRunStateMirror: (
+			callback: (
+				sessionId: string,
+				state: import('../shared/autoRunBroadcast').AutoRunBroadcastState | null
+			) => void
+		) => () => void;
+		onRemoteStopAutoRun: (callback: (sessionId: string) => void) => () => void;
+		onRemoteAutoRunSteeringCommand: (
+			callback: (request: SteeringCommandRequest, responseChannel: string) => void
+		) => () => void;
+		sendRemoteAutoRunSteeringCommandResponse: (
+			responseChannel: string,
+			result: SteeringCommandResult
+		) => void;
+		onRemoteResetAutoRunDocTasks: (
+			callback: (sessionId: string, filename: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteResetAutoRunDocTasksResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteResumeAutoRunError: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteResumeAutoRunErrorResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteSkipAutoRunDocument: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteSkipAutoRunDocumentResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteAbortAutoRunError: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteAbortAutoRunErrorResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteListPlaybooks: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteListPlaybooksResponse: (responseChannel: string, playbooks: unknown[]) => void;
+		onRemoteCreatePlaybook: (
+			callback: (sessionId: string, playbook: unknown, responseChannel: string) => void
+		) => () => void;
+		sendRemoteCreatePlaybookResponse: (responseChannel: string, playbook: unknown) => void;
+		onRemoteUpdatePlaybook: (
+			callback: (
+				sessionId: string,
+				playbookId: string,
+				updates: unknown,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteUpdatePlaybookResponse: (responseChannel: string, playbook: unknown) => void;
+		onRemoteDeletePlaybook: (
+			callback: (sessionId: string, playbookId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteDeletePlaybookResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteSetSetting: (
+			callback: (key: string, value: unknown, responseChannel: string) => void
+		) => () => void;
+		sendRemoteSetSettingResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteCreateSession: (
+			callback: (
+				name: string,
+				toolType: string,
+				cwd: string,
+				groupId: string | undefined,
+				config: Record<string, unknown> | undefined,
+				responseChannel: string,
+				background?: boolean
+			) => void
+		) => () => void;
+		sendRemoteCreateSessionResponse: (
+			responseChannel: string,
+			result: { sessionId: string } | null
+		) => void;
+		onRemoteDeleteSession: (callback: (sessionId: string) => void) => () => void;
+		onRemoteRenameSession: (
+			callback: (sessionId: string, newName: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteRenameSessionResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteUpdateSessionCwd: (
+			callback: (sessionId: string, newCwd: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteUpdateSessionCwdResponse: (
+			responseChannel: string,
+			result: { success: boolean; error?: string }
+		) => void;
+		onRemoteUpdateSessionSsh: (
+			callback: (
+				sessionId: string,
+				sshPatch: Record<string, unknown>,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteUpdateSessionSshResponse: (
+			responseChannel: string,
+			result: { success: boolean; error?: string }
+		) => void;
+		onRemoteUpdateSessionConfig: (
+			callback: (
+				sessionId: string,
+				configPatch: Record<string, unknown>,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteUpdateSessionConfigResponse: (
+			responseChannel: string,
+			result: { success: boolean; error?: string }
+		) => void;
+		onRemoteCreateGroup: (
+			callback: (
+				name: string,
+				emoji: string | undefined,
+				parentGroupId: string | undefined,
+				appearance: import('../shared/groupAppearance').GroupAppearance,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteCreateGroupResponse: (responseChannel: string, result: { id: string } | null) => void;
+		onRemoteRenameGroup: (
+			callback: (groupId: string, name: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteRenameGroupResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteUpdateGroup: (
+			callback: (
+				groupId: string,
+				update: import('../shared/groupAppearance').GroupUpdateRequest,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteUpdateGroupResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteDeleteGroup: (callback: (groupId: string) => void) => () => void;
+		onRemoteMoveSessionToGroup: (
+			callback: (sessionId: string, groupId: string | null, responseChannel: string) => void
+		) => () => void;
+		sendRemoteMoveSessionToGroupResponse: (responseChannel: string, success: boolean) => void;
+		onRemoteGetGitStatus: (
+			callback: (sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendRemoteGetGitStatusResponse: (responseChannel: string, result: any) => void;
+		onRemoteGetGitDiff: (
+			callback: (sessionId: string, filePath: string | undefined, responseChannel: string) => void
+		) => () => void;
+		sendRemoteGetGitDiffResponse: (responseChannel: string, result: any) => void;
+		onRemoteCreateGist: (
+			callback: (
+				sessionId: string,
+				description: string,
+				isPublic: boolean,
+				agentSessionId: string | undefined,
+				responseChannel: string
+			) => void
+		) => () => void;
+		sendRemoteCreateGistResponse: (
+			responseChannel: string,
+			result: { success: boolean; gistUrl?: string; error?: string }
+		) => void;
+		onRemoteTriggerCueSubscription: (
+			callback: (
+				subscriptionName: string,
+				prompt: string | undefined,
+				responseChannel: string,
+				sourceAgentId: string | undefined
+			) => void
+		) => () => void;
+		sendRemoteTriggerCueSubscriptionResponse: (responseChannel: string, result: unknown) => void;
+		onStderr: (callback: (sessionId: string, data: string) => void) => () => void;
+		onCommandExit: (callback: (sessionId: string, code: number) => void) => () => void;
+		onUsage: (callback: (sessionId: string, usageStats: UsageStats) => void) => () => void;
+		onAgentError: (
+			callback: (
+				sessionId: string,
+				error: {
+					type: string;
+					message: string;
+					recoverable: boolean;
+					agentId: string;
+					sessionId?: string;
+					timestamp: number;
+					raw?: {
+						exitCode?: number;
+						stderr?: string;
+						stdout?: string;
+						errorLine?: string;
+					};
+					parsedJson?: unknown;
+				}
+			) => void
+		) => () => void;
+		onAuthExpired: (
+			callback: (payload: {
+				sessionId: string;
+				agentId: string;
+				message: string;
+				fromPipeline?: boolean;
+			}) => void
+		) => () => void;
+	};
+	feedback: {
+		checkGhAuth: (options?: {
+			fresh?: boolean;
+		}) => Promise<import('../shared/feedback').FeedbackAuthResponse>;
+		getGhLoginCommand: () => Promise<import('../shared/feedback').FeedbackGhLoginCommand>;
+		submit: (payload: {
+			sessionId: string;
+			category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+			summary: string;
+			expectedBehavior: string;
+			details: string;
+			reproductionSteps?: string;
+			additionalContext?: string;
+			agentProvider?: string;
+			sshRemoteEnabled?: boolean;
+			attachments?: Array<{ name: string; dataUrl: string }>;
+		}) => Promise<{ success: boolean; error?: string }>;
+		composePrompt: (
+			feedbackText: string,
+			attachments?: Array<{ name: string; dataUrl: string }>
+		) => Promise<{ prompt: string }>;
+		getConversationPrompt: () => Promise<{ prompt: string; environment: string; cwd: string }>;
+		submitConversation: (payload: {
+			category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+			summary: string;
+			expectedBehavior: string;
+			actualBehavior: string;
+			reproductionSteps?: string;
+			additionalContext?: string;
+			agentProvider?: string;
+			sshRemoteEnabled?: boolean;
+			attachments?: Array<{ name: string; dataUrl: string }>;
+			includeDebugPackage?: boolean;
+			performanceTracePath?: string;
+		}) => Promise<import('../shared/feedback').FeedbackSubmitResponse>;
+		searchIssues: (query: string) => Promise<{
+			issues: Array<{
+				number: number;
+				title: string;
+				url: string;
+				state: string;
+				labels: string[];
+				createdAt: string;
+				author: string;
+				commentCount: number;
+			}>;
+		}>;
+		subscribeIssue: (
+			issueNumber: number,
+			comment?: string
+		) => Promise<import('../shared/feedback').FeedbackSubmitResponse>;
+		listAccounts: () => Promise<import('../shared/feedbackAccounts').FeedbackAccountsResponse>;
+		rememberAccount: (key: string | null) => Promise<void>;
+		drafts: {
+			list: () => Promise<{
+				drafts: Array<{
+					id: string;
+					suggestedName: string;
+					category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					summary: string;
+					confidence: number;
+					agentType: string;
+					messages: Array<{
+						role: 'user' | 'assistant' | 'system';
+						content: string;
+						timestamp: number;
+						confidence?: number;
+						category?: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+						summary?: string;
+					}>;
+					attachments: Array<{ id: string; name: string; dataUrl: string; sizeBytes: number }>;
+					inputDraft: string;
+					includeDebugPackage: boolean;
+					createdAt: number;
+					updatedAt: number;
+					lastResponse?: {
+						confidence: number;
+						ready: boolean;
+						message: string;
+						category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+						summary: string;
+						structured: {
+							expectedBehavior: string;
+							actualBehavior: string;
+							reproductionSteps: string;
+							additionalContext: string;
+						};
+					} | null;
+				}>;
+			}>;
+			save: (draft: {
+				id: string;
+				suggestedName: string;
+				category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+				summary: string;
+				confidence: number;
+				agentType: string;
+				messages: Array<{
+					role: 'user' | 'assistant' | 'system';
+					content: string;
+					timestamp: number;
+					confidence?: number;
+					category?: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					summary?: string;
+				}>;
+				attachments: Array<{ id: string; name: string; dataUrl: string; sizeBytes: number }>;
+				inputDraft: string;
+				includeDebugPackage: boolean;
+				createdAt: number;
+				updatedAt: number;
+				lastResponse?: {
+					confidence: number;
+					ready: boolean;
+					message: string;
+					category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					summary: string;
+					structured: {
+						expectedBehavior: string;
+						actualBehavior: string;
+						reproductionSteps: string;
+						additionalContext: string;
+					};
+				} | null;
+			}) => Promise<{
+				draft: {
+					id: string;
+					suggestedName: string;
+					category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					summary: string;
+					confidence: number;
+					agentType: string;
+					messages: Array<{
+						role: 'user' | 'assistant' | 'system';
+						content: string;
+						timestamp: number;
+						confidence?: number;
+						category?: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+						summary?: string;
+					}>;
+					attachments: Array<{ id: string; name: string; dataUrl: string; sizeBytes: number }>;
+					inputDraft: string;
+					includeDebugPackage: boolean;
+					createdAt: number;
+					updatedAt: number;
+					lastResponse?: {
+						confidence: number;
+						ready: boolean;
+						message: string;
+						category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+						summary: string;
+						structured: {
+							expectedBehavior: string;
+							actualBehavior: string;
+							reproductionSteps: string;
+							additionalContext: string;
+						};
+					} | null;
+				};
+			}>;
+			delete: (id: string) => Promise<Record<string, never>>;
+		};
+		issues: {
+			list: () => Promise<{
+				issues: Array<{
+					number: number;
+					url: string;
+					title: string;
+					category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					submittedAt: number;
+					state: 'open' | 'closed';
+					lastCheckedAt: number;
+				}>;
+			}>;
+			delete: (issueNumber: number) => Promise<Record<string, never>>;
+			refreshStates: () => Promise<{
+				issues: Array<{
+					number: number;
+					url: string;
+					title: string;
+					category: 'bug_report' | 'feature_request' | 'improvement' | 'general_feedback';
+					submittedAt: number;
+					state: 'open' | 'closed';
+					lastCheckedAt: number;
+				}>;
+			}>;
+		};
+	};
+	agentError: {
+		clearError: (sessionId: string) => Promise<{ success: boolean }>;
+		retryAfterError: (
+			sessionId: string,
+			options?: {
+				prompt?: string;
+				newSession?: boolean;
+			}
+		) => Promise<{ success: boolean }>;
+	};
+	web: {
+		claimAutoRunStart: (sessionId: string) => Promise<boolean>;
+		releaseAutoRunStartClaim: (sessionId: string) => Promise<boolean>;
+		requestNewTab: (sessionId: string, background?: boolean) => Promise<{ tabId: string } | null>;
+		requestCloseTab: (sessionId: string, tabId: string) => Promise<boolean>;
+		broadcastUserInput: (
+			sessionId: string,
+			command: string,
+			inputMode: 'ai' | 'terminal'
+		) => Promise<void>;
+		broadcastAutoRunState: (
+			sessionId: string,
+			state: import('../shared/autoRunBroadcast').AutoRunBroadcastState | null
+		) => Promise<void>;
+		broadcastTabsChange: (
+			sessionId: string,
+			aiTabs: import('../main/web-server/types').AITabData[],
+			activeTabId: string,
+			activeTabChanged?: boolean
+		) => Promise<void>;
+		broadcastSessionState: (
+			sessionId: string,
+			state: string,
+			additionalData?: {
+				name?: string;
+				toolType?: string;
+				inputMode?: string;
+				cwd?: string;
+			}
+		) => Promise<boolean>;
+	};
+	// Git API - all methods accept optional sshRemoteId and remoteCwd for remote execution via SSH
+	git: {
+		status: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ stdout: string; stderr: string; timedOut?: boolean }>;
+		diff: (
+			cwd: string,
+			file?: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ stdout: string; stderr: string }>;
+		isRepo: (cwd: string, sshRemoteId?: string, remoteCwd?: string) => Promise<boolean>;
+		init: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		commitAll: (
+			cwd: string,
+			message: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ success: boolean; committed: boolean; commitHash?: string; error?: string }>;
+		numstat: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ stdout: string; stderr: string; timedOut?: boolean }>;
+		branch: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ stdout: string; stderr: string; timedOut?: boolean }>;
+		/**
+		 * Get list of all branches
+		 */
+		branches: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ branches: string[] }>;
+		/**
+		 * Get list of tags
+		 */
+		tags: (cwd: string, sshRemoteId?: string, remoteCwd?: string) => Promise<{ tags: string[] }>;
+		/**
+		 * Get remote URL
+		 */
+		remote: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ stdout: string; stderr: string }>;
+		info: (
+			cwd: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{
+			branch: string;
+			remote: string;
+			behind: number;
+			ahead: number;
+			uncommittedChanges: number;
+			/** One of the underlying queries timed out; the zero/empty fields are placeholders. */
+			timedOut?: boolean;
+		}>;
+		log: (
+			cwd: string,
+			options?: { limit?: number; search?: string },
+			sshRemoteId?: string
+		) => Promise<{
+			entries: Array<{
+				hash: string;
+				shortHash: string;
+				author: string;
+				date: string;
+				refs: string[];
+				subject: string;
+				additions?: number;
+				deletions?: number;
+			}>;
+			error: string | null;
+		}>;
+		/**
+		 * Run a network git operation (pull/push/fetch) and stream its output.
+		 * Subscribe via `onCommandOutput` before calling.
+		 */
+		runCommand: (options: {
+			runId: string;
+			operation: import('../shared/gitUtils').GitStreamingOperation;
+			cwd: string;
+			sshRemoteId?: string;
+			remoteCwd?: string;
+			setUpstream?: boolean;
+		}) => Promise<import('../shared/gitUtils').GitRunCommandResult>;
+		/** Terminate an in-flight `runCommand`. */
+		cancelCommand: (runId: string) => Promise<{ success: boolean }>;
+		/** Subscribe to streamed `runCommand` output. Returns an unsubscribe. */
+		onCommandOutput: (
+			callback: (data: import('../shared/gitUtils').GitCommandOutputChunk) => void
+		) => () => void;
+		/** Check out a branch (pass createTracking for an origin-only branch). */
+		checkoutBranch: (
+			cwd: string,
+			branch: string,
+			createTracking?: boolean,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ success: boolean; output?: string; error?: string }>;
+		commitCount: (
+			cwd: string,
+			sshRemoteId?: string
+		) => Promise<{ count: number; error: string | null }>;
+		graph: (
+			cwd: string,
+			options?: { limit?: number },
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{
+			nodes: Array<{
+				hash: string;
+				shortHash: string;
+				parents: string[];
+				author: string;
+				date: string;
+				refs: string[];
+				subject: string;
+			}>;
+			error: string | null;
+		}>;
+		switchBranch: (
+			cwd: string,
+			branchName: string,
+			sshRemoteId?: string,
+			remoteCwd?: string
+		) => Promise<{ success: boolean; stdout: string; stderr: string }>;
+		show: (
+			cwd: string,
+			hash: string,
+			sshRemoteId?: string
+		) => Promise<{ stdout: string; stderr: string }>;
+		/**
+		 * Show file content at a specific ref
+		 */
+		showFile: (
+			cwd: string,
+			ref: string,
+			filePath: string
+		) => Promise<{ content?: string; error?: string }>;
+		checkGhCli: (ghPath?: string) => Promise<{ installed: boolean; authenticated: boolean }>;
+		createGist: (
+			filename: string,
+			content: string,
+			description: string,
+			isPublic: boolean,
+			ghPath?: string
+		) => Promise<{
+			success: boolean;
+			gistUrl?: string;
+			error?: string;
+		}>;
+		// Git worktree operations for Auto Run parallelization
+		// All worktree operations support SSH remote execution via optional sshRemoteId parameter
+		worktreeInfo: (
+			worktreePath: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			exists?: boolean;
+			isWorktree?: boolean;
+			currentBranch?: string;
+			repoRoot?: string;
+			error?: string;
+		}>;
+		getRepoRoot: (
+			cwd: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			root?: string;
+			error?: string;
+		}>;
+		worktreeSetup: (
+			mainRepoCwd: string,
+			worktreePath: string,
+			branchName: string,
+			sshRemoteId?: string,
+			baseBranch?: string
+		) => Promise<GitWorktreeSetupResult>;
+		worktreeRunSetup: (
+			script: string,
+			context: WorktreeSetupScriptContext,
+			sshRemoteId?: string
+		) => Promise<GitWorktreeRunSetupResult>;
+		worktreeCheckout: (
+			worktreePath: string,
+			branchName: string,
+			createIfMissing: boolean,
+			sshRemoteId?: string
+		) => Promise<GitWorktreeCheckoutResult>;
+		createPR: (
+			worktreePath: string,
+			baseBranch: string,
+			title: string,
+			body: string,
+			ghPath?: string
+		) => Promise<{
+			success: boolean;
+			prUrl?: string;
+			error?: string;
+		}>;
+		getDefaultBranch: (cwd: string) => Promise<{
+			success: boolean;
+			branch?: string;
+			error?: string;
+		}>;
+		checkGhCli: (ghPath?: string) => Promise<{
+			installed: boolean;
+			authenticated: boolean;
+		}>;
+		// Supports SSH remote execution via optional sshRemoteId parameter
+		listWorktrees: (
+			cwd: string,
+			sshRemoteId?: string,
+			basePath?: string,
+			sessionPaths?: string[]
+		) => Promise<{
+			resolvedCwd?: string;
+			resolvedBasePath?: string;
+			resolvedSessionPaths?: Record<string, string>;
+			// Missing candidates are safe to reconcile only after a successful registry read.
+			missingSessionPaths?: string[];
+			/** Individual aliases that could not be resolved; keep their existing sessions. */
+			unresolvedSessionPaths?: string[];
+			worktrees: Array<{
+				path: string;
+				resolvedPath?: string;
+				pathUnresolved?: boolean;
+				pathMissing?: boolean;
+				isPrunable?: boolean;
+				head: string;
+				branch: string | null;
+				isBare: boolean;
+			}>;
+		}>;
+		scanWorktreeDirectory: (
+			parentPath: string,
+			sshRemoteId?: string
+		) => Promise<{
+			gitSubdirs: Array<{
+				path: string;
+				name: string;
+				isWorktree: boolean;
+				branch: string | null;
+				repoRoot: string | null;
+			}>;
+			scanFailed?: boolean;
+			/** Uncertain candidate or group roots whose existing sessions must be preserved. */
+			unresolvedPaths?: string[];
+		}>;
+		// File watching is not available for SSH remote sessions.
+		// For remote sessions, returns isRemote: true indicating polling should be used instead.
+		watchWorktreeDirectory: (
+			sessionId: string,
+			worktreePath: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			error?: string;
+			isRemote?: boolean;
+			message?: string;
+		}>;
+		unwatchWorktreeDirectory: (sessionId: string) => Promise<{
+			success: boolean;
+		}>;
+		removeWorktree: (
+			worktreePath: string,
+			force?: boolean
+		) => Promise<{
+			success: boolean;
+			error?: string;
+			hasUncommittedChanges?: boolean;
+		}>;
+		onWorktreeDiscovered: (
+			callback: (data: {
+				sessionId: string;
+				worktree: { path: string; name: string; branch: string | null };
+			}) => void
+		) => () => void;
+		onWorktreeRemoved: (
+			callback: (data: { sessionId: string; worktreePath: string }) => void
+		) => () => void;
+	};
+	/**
+	 * Parquet preview. The file stays open in the main process and only the
+	 * displayed window of rows crosses this bridge - see
+	 * src/shared/parquet/preview.ts for why a parquet read returns a marker
+	 * instead of content.
+	 */
+	parquet: {
+		open: (filePath: string, sshRemoteId?: string) => Promise<ParquetFileInfo>;
+		query: (request: ParquetQueryRequest) => Promise<ParquetQueryResult>;
+		export: (options: {
+			handle: string;
+			filter: string;
+			columns?: string[];
+			sort?: ParquetSortSpec | null;
+			destPath: string;
+			format: 'csv' | 'jsonl';
+			maxRows?: number;
+		}) => Promise<{ path: string; rows: number; truncated: boolean }>;
+		close: (handle: string) => Promise<void>;
+		onFetchProgress: (callback: (progress: ParquetFetchProgress) => void) => () => void;
+	};
+	fs: {
+		homeDir: () => Promise<string>;
+		readDir: (dirPath: string, sshRemoteId?: string) => Promise<DirectoryEntry[]>;
+		listTreeRemote: (
+			rootPath: string,
+			sshRemoteId: string,
+			options: {
+				maxDepth?: number;
+				ignorePatterns?: string[];
+				excludePaths?: string[];
+				maxFiles?: number;
+			}
+		) => Promise<{ directories: string[]; files: string[]; truncated: boolean }>;
+		/**
+		 * Walk a LOCAL directory tree in one round-trip. Recursing with `readDir`
+		 * from the renderer costs a round-trip per folder, which is what a large
+		 * tree's load time is actually made of. SSH uses `listTreeRemote`.
+		 */
+		readDirTree: (
+			dirPath: string,
+			options: {
+				maxDepth: number;
+				maxEntries?: number;
+				ignorePatterns?: string[];
+				honorGitignore?: boolean;
+				expandedPaths?: string[];
+			}
+		) => Promise<{
+			tree: LocalFileScanNode[];
+			truncated: boolean;
+			filesFound: number;
+			directoriesScanned: number;
+		}>;
+		readFile: (
+			filePath: string,
+			sshRemoteId?: string,
+			requestId?: string
+		) => Promise<string | null>;
+		cancelReadFile: (requestId: string) => Promise<void>;
+		downloadRemoteFile: (
+			remotePath: string,
+			sshRemoteId: string,
+			localDestPath?: string
+		) => Promise<{ success: boolean; path: string }>;
+		writeFile: (
+			filePath: string,
+			content: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean }>;
+		writeImageFile: (
+			filePath: string,
+			dataUrl: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean }>;
+		mkdir: (dirPath: string, sshRemoteId?: string) => Promise<{ success: boolean }>;
+		stat: (
+			filePath: string,
+			sshRemoteId?: string
+		) => Promise<{
+			size: number;
+			createdAt: string;
+			modifiedAt: string;
+			isDirectory: boolean;
+			isFile: boolean;
+		} | null>;
+		directorySize: (
+			dirPath: string,
+			sshRemoteId?: string,
+			ignorePatterns?: string[],
+			honorGitignore?: boolean
+		) => Promise<{
+			totalSize: number;
+			fileCount: number;
+			folderCount: number;
+		}>;
+		fetchImageAsBase64: (url: string) => Promise<string | null>;
+		rename: (
+			oldPath: string,
+			newPath: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean }>;
+		delete: (
+			targetPath: string,
+			options?: { recursive?: boolean; sshRemoteId?: string }
+		) => Promise<{ success: boolean }>;
+		/**
+		 * Delete many paths in one IPC call. Resolves with a per-path outcome in
+		 * input order instead of rejecting on the first failure.
+		 */
+		deleteMany: (
+			targetPaths: string[],
+			options?: { recursive?: boolean; sshRemoteId?: string }
+		) => Promise<{ results: Array<{ path: string; success: boolean; error?: string }> }>;
+		countItems: (
+			dirPath: string,
+			sshRemoteId?: string
+		) => Promise<{ fileCount: number; folderCount: number }>;
+		/** Zip a folder into a `.zip` beside it, auto-suffixing on name collision. */
+		compressFolder: (
+			folderPath: string,
+			options?: { sshRemoteId?: string }
+		) => Promise<{ success: boolean; path: string; name: string }>;
+		copyPath: (
+			sourcePath: string,
+			destPath: string,
+			options?: { overwrite?: boolean; sshRemoteId?: string }
+		) => Promise<{ success: boolean }>;
+		startDragOut: (paths: string[]) => void;
+		getPathForFile: (file: File) => string;
+	};
+	webserver: {
+		getUrl: () => Promise<string>;
+		getConnectedClients: () => Promise<number>;
+	};
+	live: {
+		toggle: (
+			sessionId: string,
+			agentSessionId?: string
+		) => Promise<{ live: boolean; url: string | null }>;
+		getStatus: (sessionId: string) => Promise<{ live: boolean; url: string | null }>;
+		getDashboardUrl: () => Promise<string | null>;
+		getLiveSessions: () => Promise<
+			Array<{ sessionId: string; agentSessionId?: string; enabledAt: number }>
+		>;
+		broadcastActiveSession: (sessionId: string) => Promise<void>;
+		disableAll: () => Promise<{ success: boolean; count: number }>;
+		startServer: () => Promise<{ success: boolean; url?: string; error?: string }>;
+		stopServer: () => Promise<{ success: boolean; error?: string }>;
+		persistCurrentToken: () => Promise<{ success: boolean; message?: string }>;
+		clearPersistentToken: () => Promise<{ success: boolean; message?: string }>;
+		/** Fires when a network change moves the LAN address in the web URL. */
+		onUrlChanged: (handler: (data: { url: string }) => void) => () => void;
+	};
+	/**
+	 * Web Login accounts. Desktop-only: the web-desktop bridge refuses every
+	 * `webLogin:*` channel, so a browser holds this namespace and gets nothing
+	 * back from it. Each verb rejects with the store's own user-facing message.
+	 */
+	webLogin: {
+		listUsers: () => Promise<WebUserPublic[]>;
+		createUser: (input: {
+			username: string;
+			password: string;
+			displayName?: string;
+		}) => Promise<WebUserPublic>;
+		setPassword: (id: string, password: string) => Promise<void>;
+		setDisplayName: (id: string, displayName: string) => Promise<WebUserPublic>;
+		setDisabled: (id: string, disabled: boolean) => Promise<WebUserPublic>;
+		deleteUser: (id: string) => Promise<void>;
+	};
+	agents: {
+		detect: (sshRemoteId?: string) => Promise<AgentConfig[]>;
+		refresh: (
+			agentId?: string,
+			sshRemoteId?: string
+		) => Promise<{
+			agents: AgentConfig[];
+			debugInfo: {
+				agentId: string;
+				available: boolean;
+				path: string | null;
+				binaryName: string;
+				envPath: string;
+				homeDir: string;
+				platform: string;
+				whichCommand: string;
+				error: string | null;
+			} | null;
+		}>;
+		get: (agentId: string, sshRemoteId?: string) => Promise<AgentConfig | null>;
+		getCapabilities: (agentId: string) => Promise<AgentCapabilities>;
+		getAllCapabilities: () => Promise<Record<string, AgentCapabilities>>;
+		getConfig: (agentId: string) => Promise<Record<string, any>>;
+		setConfig: (agentId: string, config: Record<string, any>) => Promise<boolean>;
+		getConfigValue: (agentId: string, key: string) => Promise<any>;
+		setConfigValue: (agentId: string, key: string, value: any) => Promise<boolean>;
+		setCustomPath: (agentId: string, customPath: string | null) => Promise<boolean>;
+		getCustomPath: (agentId: string) => Promise<string | null>;
+		getAllCustomPaths: () => Promise<Record<string, string>>;
+		setCustomArgs: (agentId: string, customArgs: string | null) => Promise<boolean>;
+		getCustomArgs: (agentId: string) => Promise<string | null>;
+		getAllCustomArgs: () => Promise<Record<string, string>>;
+		setCustomEnvVars: (
+			agentId: string,
+			customEnvVars: Record<string, string> | null
+		) => Promise<boolean>;
+		getCustomEnvVars: (agentId: string) => Promise<Record<string, string> | null>;
+		getAllCustomEnvVars: () => Promise<Record<string, Record<string, string>>>;
+		getKnownAuthDirs: () => Promise<{ claudeConfigDirs: string[]; codexHomes: string[] }>;
+		getKnownEnvVarKeys: () => Promise<{
+			byProvider: Record<string, string[]>;
+			global: string[];
+		}>;
+		getModels: (agentId: string, forceRefresh?: boolean, sshRemoteId?: string) => Promise<string[]>;
+		getConfigOptions: (
+			agentId: string,
+			optionKey: string,
+			forceRefresh?: boolean
+		) => Promise<string[]>;
+		discoverSlashCommands: (
+			agentId: string,
+			cwd: string,
+			customPath?: string,
+			sshRemoteId?: string
+		) => Promise<{ name: string; prompt?: string; description?: string }[] | null>;
+
+		// Capability snapshots - persisted per-agent readiness + version info.
+		getSnapshot: (
+			agentId: string,
+			sshRemoteId?: string
+		) => Promise<import('../shared/agentCapabilities').AgentCapabilitiesSnapshot | null>;
+		getAllSnapshots: () => Promise<
+			import('../shared/agentCapabilities').AgentCapabilitiesSnapshotMap
+		>;
+		reprobe: (
+			agentId: string,
+			sshRemoteId?: string
+		) => Promise<import('../shared/agentCapabilities').AgentCapabilitiesSnapshot | null>;
+		onSnapshotUpdated: (
+			callback: (payload: import('../shared/agentCapabilities').SnapshotUpdatedPayload) => void
+		) => () => void;
+		getMaestroPDetectedPath: () => Promise<string | null>;
+		getRemoteMaestroPAvailable: (sshRemoteId: string, force?: boolean) => Promise<boolean | null>;
+		getClaudeUsageSnapshots: () => Promise<
+			Record<
+				string,
+				{
+					sampledAt: string;
+					configDirKey: string;
+					authState?: 'authenticated' | 'unauthenticated';
+					accountEmail?: string;
+					accountUuid?: string;
+					organizationName?: string;
+					session: { percent: number; resetsAt?: string };
+					weekAllModels: { percent: number; resetsAt?: string };
+					weekSonnetOnly: { percent: number; resetsAt?: string; label?: string };
+				}
+			>
+		>;
+		getClaudeUsageAccountKeys: () => Promise<string[]>;
+		getLimitResetAt: (agentId: string, claudeConfigDir?: string) => Promise<number | undefined>;
+		getCodexUsageSnapshots: () => Promise<
+			Record<
+				string,
+				{
+					sampledAt: string;
+					codexHomeKey: string;
+					authState: 'authenticated' | 'missing_auth' | 'unauthenticated' | 'error';
+					label?: string;
+					email?: string;
+					planType?: string;
+					session?: { percent: number; resetsAt: string; windowSeconds?: number };
+					weekly?: { percent: number; resetsAt: string; windowSeconds?: number };
+					additionalLimits?: Array<{
+						name: string;
+						percent: number;
+						resetsAt?: string;
+						windowSeconds?: number;
+					}>;
+					resetCredits?: import('../shared/codexResetCredits').CodexResetCreditCounts;
+					error?: string;
+				}
+			>
+		>;
+		getCodexUsageAccountKeys: () => Promise<string[]>;
+		/** READ: the reset credits one Codex account holds. */
+		getCodexResetCredits: (codexHome: string) => Promise<{
+			ok: boolean;
+			detail?: import('../shared/codexResetCredits').CodexResetCreditsDetail;
+			error?: string;
+		}>;
+		/** WRITE: redeem one reset credit. Irreversible; pass a stable key to make a retry safe. */
+		consumeCodexResetCredit: (
+			codexHome: string,
+			creditId: string,
+			idempotencyKey?: string
+		) => Promise<import('../shared/codexResetCredits').CodexResetCreditConsumeResult>;
+		refreshClaudeUsageSnapshots: () => Promise<{ refreshed: number }>;
+		refreshCodexUsageSnapshots: () => Promise<{ refreshed: number }>;
+	};
+	// Agent Sessions API - all methods accept optional sshRemoteId for SSH remote session storage access
+	agentSessions: {
+		list: (
+			agentId: string,
+			projectPath: string,
+			sshRemoteId?: string
+		) => Promise<
+			Array<{
+				sessionId: string;
+				projectPath: string;
+				timestamp: string;
+				modifiedAt: string;
+				firstMessage: string;
+				messageCount: number;
+				sizeBytes: number;
+				costUsd?: number;
+				inputTokens: number;
+				outputTokens: number;
+				cacheReadTokens: number;
+				cacheCreationTokens: number;
+				durationSeconds: number;
+			}>
+		>;
+		listPaginated: (
+			agentId: string,
+			projectPath: string,
+			options?: { cursor?: string; limit?: number; ownerAgentId?: string },
+			sshRemoteId?: string
+		) => Promise<{
+			sessions: Array<{
+				sessionId: string;
+				projectPath: string;
+				timestamp: string;
+				modifiedAt: string;
+				firstMessage: string;
+				messageCount: number;
+				sizeBytes: number;
+				costUsd?: number;
+				inputTokens: number;
+				outputTokens: number;
+				cacheReadTokens: number;
+				cacheCreationTokens: number;
+				durationSeconds: number;
+				origin?: 'user' | 'auto';
+				sessionName?: string;
+				starred?: boolean;
+			}>;
+			hasMore: boolean;
+			totalCount: number;
+			nextCursor: string | null;
+		}>;
+		read: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			options?: { offset?: number; limit?: number },
+			sshRemoteId?: string
+		) => Promise<{
+			messages: Array<{
+				type: string;
+				role?: string;
+				content: string;
+				timestamp: string;
+				uuid: string;
+				toolUse?: unknown;
+			}>;
+			total: number;
+			hasMore: boolean;
+		}>;
+		search: (
+			agentId: string,
+			projectPath: string,
+			query: string,
+			searchMode: 'title' | 'user' | 'assistant' | 'all',
+			sshRemoteId?: string
+		) => Promise<
+			Array<{
+				sessionId: string;
+				matchType: 'title' | 'user' | 'assistant';
+				matchPreview: string;
+				matchCount: number;
+			}>
+		>;
+		getPath: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			sshRemoteId?: string
+		) => Promise<string | null>;
+		// Delete a message pair from a session (not supported for SSH remote sessions)
+		deleteMessagePair: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			userMessageUuid: string,
+			fallbackContent?: string
+		) => Promise<{
+			success: boolean;
+			error?: string;
+			linesRemoved?: number;
+		}>;
+		hasStorage: (agentId: string) => Promise<boolean>;
+		getAvailableStorages: () => Promise<string[]>;
+		getGlobalStats: () => Promise<{
+			totalSessions: number;
+			totalMessages: number;
+			totalInputTokens: number;
+			totalOutputTokens: number;
+			totalCacheReadTokens: number;
+			totalCacheCreationTokens: number;
+			totalCostUsd: number;
+			hasCostData: boolean;
+			totalSizeBytes: number;
+			isComplete: boolean;
+			byProvider: Record<
+				string,
+				{
+					sessions: number;
+					messages: number;
+					inputTokens: number;
+					outputTokens: number;
+					costUsd: number;
+					hasCostData: boolean;
+				}
+			>;
+		}>;
+		onGlobalStatsUpdate: (
+			callback: (stats: {
+				totalSessions: number;
+				totalMessages: number;
+				totalInputTokens: number;
+				totalOutputTokens: number;
+				totalCacheReadTokens: number;
+				totalCacheCreationTokens: number;
+				totalCostUsd: number;
+				hasCostData: boolean;
+				totalSizeBytes: number;
+				isComplete: boolean;
+				byProvider: Record<
+					string,
+					{
+						sessions: number;
+						messages: number;
+						inputTokens: number;
+						outputTokens: number;
+						costUsd: number;
+						hasCostData: boolean;
+					}
+				>;
+			}) => void
+		) => () => void;
+		getAllNamedSessions: () => Promise<
+			Array<{
+				agentId: string;
+				agentSessionId: string;
+				projectPath: string;
+				sessionName: string;
+				starred?: boolean;
+				lastActivityAt?: number;
+			}>
+		>;
+		registerSessionOrigin: (
+			projectPath: string,
+			agentSessionId: string,
+			origin: 'user' | 'auto',
+			sessionName?: string
+		) => Promise<boolean>;
+		updateSessionName: (
+			projectPath: string,
+			agentSessionId: string,
+			sessionName: string
+		) => Promise<boolean>;
+		// Generic session origins API (for non-Claude agents like Codex, OpenCode)
+		getOrigins: (
+			agentId: string,
+			projectPath: string
+		) => Promise<
+			Record<string, { origin?: 'user' | 'auto'; sessionName?: string; starred?: boolean }>
+		>;
+		setSessionName: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			sessionName: string | null
+		) => Promise<void>;
+		setSessionStarred: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			starred: boolean
+		) => Promise<void>;
+		snapshotStarredTranscript: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string,
+			sessionName?: string,
+			reason?: 'starred' | 'snoozed'
+		) => Promise<void>;
+		releaseSnoozedTranscript: (
+			agentId: string,
+			projectPath: string,
+			sessionId: string
+		) => Promise<void>;
+	};
+	dialog: {
+		selectFolder: () => Promise<string | null>;
+		saveFile: (options: {
+			defaultPath?: string;
+			filters?: Array<{ name: string; extensions: string[] }>;
+			title?: string;
+		}) => Promise<string | null>;
+	};
+	fonts: {
+		detect: () => Promise<string[]>;
+	};
+	shells: {
+		detect: () => Promise<ShellInfo[]>;
+	};
+	shell: {
+		openExternal: (url: string) => Promise<void>;
+		openPath: (itemPath: string) => Promise<void>;
+		trashItem: (itemPath: string) => Promise<void>;
+		showItemInFolder: (itemPath: string) => Promise<void>;
+		copyTextToClipboard: (text: string) => Promise<void>;
+		copyImageToClipboard: (dataUrl: string) => Promise<void>;
+		readImageFromClipboard: () => Promise<string | null>;
+		capturePage: (rect?: {
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+		}) => Promise<string | null>;
+	};
+	tunnel: {
+		isCloudflaredInstalled: () => Promise<boolean>;
+		start: () => Promise<{ success: boolean; url?: string; error?: string }>;
+		stop: () => Promise<{ success: boolean }>;
+		getStatus: () => Promise<{ isRunning: boolean; url: string | null; error: string | null }>;
+	};
+	sshRemote: {
+		saveConfig: (config: {
+			id?: string;
+			name?: string;
+			host?: string;
+			port?: number;
+			username?: string;
+			privateKeyPath?: string;
+			remoteEnv?: Record<string, string>;
+			enabled?: boolean;
+		}) => Promise<{
+			success: boolean;
+			config?: {
+				id: string;
+				name: string;
+				host: string;
+				port: number;
+				username: string;
+				privateKeyPath: string;
+				remoteEnv?: Record<string, string>;
+				enabled: boolean;
+			};
+			error?: string;
+		}>;
+		deleteConfig: (id: string) => Promise<{ success: boolean; error?: string }>;
+		getConfigs: () => Promise<{
+			success: boolean;
+			configs?: Array<{
+				id: string;
+				name: string;
+				host: string;
+				port: number;
+				username: string;
+				privateKeyPath: string;
+				remoteEnv?: Record<string, string>;
+				enabled: boolean;
+			}>;
+			error?: string;
+		}>;
+		getDefaultId: () => Promise<{ success: boolean; id?: string | null; error?: string }>;
+		setDefaultId: (id: string | null) => Promise<{ success: boolean; error?: string }>;
+		test: (
+			configOrId:
+				| string
+				| {
+						id: string;
+						name: string;
+						host: string;
+						port: number;
+						username: string;
+						privateKeyPath: string;
+						remoteEnv?: Record<string, string>;
+						enabled: boolean;
+				  },
+			agentCommand?: string
+		) => Promise<{
+			success: boolean;
+			result?: {
+				success: boolean;
+				error?: string;
+				remoteInfo?: {
+					hostname: string;
+					agentVersion?: string;
+				};
+			};
+			error?: string;
+		}>;
+		getSshConfigHosts: () => Promise<{
+			success: boolean;
+			hosts: Array<{
+				host: string;
+				hostName?: string;
+				port?: number;
+				user?: string;
+				identityFile?: string;
+				proxyJump?: string;
+			}>;
+			error?: string;
+			configPath: string;
+		}>;
+	};
+	devtools: {
+		open: () => Promise<void>;
+		close: () => Promise<void>;
+		toggle: () => Promise<void>;
+	};
+	power: {
+		setEnabled: (enabled: boolean) => Promise<void>;
+		isEnabled: () => Promise<boolean>;
+		setKeepDisplayAwake: (keepAwake: boolean) => Promise<void>;
+		getStatus: () => Promise<{
+			enabled: boolean;
+			blocking: boolean;
+			reasons: string[];
+			keepDisplayAwake: boolean;
+			platform: 'darwin' | 'win32' | 'linux';
+		}>;
+		addReason: (reason: string) => Promise<void>;
+		removeReason: (reason: string) => Promise<void>;
+	};
+	app: {
+		onQuitConfirmationRequest: (callback: () => void) => () => void;
+		confirmQuit: () => void;
+		cancelQuit: () => void;
+		quitConfirmationPending: () => void;
+		/** `sleptMs` is the machine-sleep gap the main process measured for this wake. */
+		onSystemResume: (callback: (info: { sleptMs: number }) => void) => () => void;
+		onBrowserTabShortcutKey: (
+			callback: (input: {
+				key: string;
+				code: string;
+				meta: boolean;
+				control: boolean;
+				alt: boolean;
+				shift: boolean;
+			}) => void
+		) => () => void;
+		/** @see ParsedDeepLink in src/shared/types.ts - keep in sync */
+		onDeepLink: (
+			callback: (deepLink: {
+				action: 'focus' | 'session' | 'group';
+				sessionId?: string;
+				tabId?: string;
+				groupId?: string;
+			}) => void
+		) => () => void;
+		onGlobalHotkeyRegistrationFailed: (callback: (keys: string[]) => void) => () => void;
+		/** Publish merged shortcut bindings so the native menu shows real accelerators. */
+		setMenuShortcutKeys: (keys: Record<string, string[]>) => void;
+		/** Native application menu click, carrying the clicked item's shortcut id. */
+		onMenuCommand: (callback: (shortcutId: string) => void) => () => void;
+	};
+	platform: string;
+	/** Resolved on-disk maestro-cli.js path (dev vs packaged), or null. */
+	maestroCliPath: string | null;
+	logger: {
+		log: (
+			level: 'debug' | 'info' | 'warn' | 'error' | 'toast' | 'autorun',
+			message: string,
+			context?: string,
+			data?: unknown
+		) => Promise<void>;
+		getLogs: (filter?: { level?: string; context?: string; limit?: number }) => Promise<
+			Array<{
+				timestamp: number;
+				level: 'debug' | 'info' | 'warn' | 'error' | 'toast' | 'autorun';
+				message: string;
+				context?: string;
+				data?: unknown;
+			}>
+		>;
+		clearLogs: () => Promise<void>;
+		setLogLevel: (level: string) => Promise<void>;
+		getLogLevel: () => Promise<string>;
+		setMaxLogBuffer: (max: number) => Promise<void>;
+		getMaxLogBuffer: () => Promise<number>;
+		toast: (title: string, data?: unknown) => Promise<void>;
+		autorun: (message: string, context?: string, data?: unknown) => Promise<void>;
+		onNewLog: (
+			callback: (log: {
+				timestamp: number;
+				level: 'debug' | 'info' | 'warn' | 'error' | 'toast' | 'autorun';
+				message: string;
+				context?: string;
+				data?: unknown;
+			}) => void
+		) => () => void;
+	};
+	claude: {
+		listSessions: (projectPath: string) => Promise<
+			Array<{
+				sessionId: string;
+				projectPath: string;
+				timestamp: string;
+				modifiedAt: string;
+				firstMessage: string;
+				messageCount: number;
+				sizeBytes: number;
+				costUsd: number;
+				inputTokens: number;
+				outputTokens: number;
+				cacheReadTokens: number;
+				cacheCreationTokens: number;
+				durationSeconds: number;
+				origin?: 'user' | 'auto';
+				sessionName?: string;
+				starred?: boolean;
+			}>
+		>;
+		getGlobalStats: () => Promise<{
+			totalSessions: number;
+			totalMessages: number;
+			totalInputTokens: number;
+			totalOutputTokens: number;
+			totalCacheReadTokens: number;
+			totalCacheCreationTokens: number;
+			totalCostUsd: number;
+			totalSizeBytes: number;
+			isComplete: boolean;
+		}>;
+		onGlobalStatsUpdate: (
+			callback: (stats: {
+				totalSessions: number;
+				totalMessages: number;
+				totalInputTokens: number;
+				totalOutputTokens: number;
+				totalCacheReadTokens: number;
+				totalCacheCreationTokens: number;
+				totalCostUsd: number;
+				totalSizeBytes: number;
+				isComplete: boolean;
+			}) => void
+		) => () => void;
+		getProjectStats: (
+			projectPath: string,
+			ownerAgentId?: string
+		) => Promise<{
+			totalSessions: number;
+			totalMessages: number;
+			totalCostUsd: number;
+			totalSizeBytes: number;
+			oldestTimestamp: string | null;
+		}>;
+		onProjectStatsUpdate: (
+			callback: (stats: {
+				projectPath: string;
+				totalSessions: number;
+				totalMessages: number;
+				totalTokens: number;
+				/** `totalTokens` by kind, over the sessions that recorded one. */
+				tokenSplit?: {
+					inputTokens: number;
+					outputTokens: number;
+					cacheReadTokens: number;
+					cacheCreationTokens: number;
+				};
+				/** Archived tokens counted in `totalTokens` with no record of their kind. */
+				unsplitTokens?: number;
+				totalCostUsd: number;
+				totalSizeBytes: number;
+				oldestTimestamp: string | null;
+				processedCount: number;
+				isComplete: boolean;
+			}) => void
+		) => () => void;
+		readSessionMessages: (
+			projectPath: string,
+			sessionId: string,
+			options?: { offset?: number; limit?: number }
+		) => Promise<{
+			messages: Array<{
+				type: string;
+				role?: string;
+				content: string;
+				timestamp: string;
+				uuid: string;
+				toolUse?: any;
+			}>;
+			total: number;
+			hasMore: boolean;
+		}>;
+		searchSessions: (
+			projectPath: string,
+			query: string,
+			searchMode: 'title' | 'user' | 'assistant' | 'all'
+		) => Promise<
+			Array<{
+				sessionId: string;
+				matchType: 'title' | 'user' | 'assistant';
+				matchPreview: string;
+				matchCount: number;
+			}>
+		>;
+		getCommands: (projectPath: string) => Promise<
+			Array<{
+				command: string;
+				description: string;
+			}>
+		>;
+		getSkills: (projectPath: string) => Promise<
+			Array<{
+				name: string;
+				description: string;
+				tokenCount: number;
+				source: 'project' | 'user';
+			}>
+		>;
+		registerSessionOrigin: (
+			projectPath: string,
+			agentSessionId: string,
+			origin: 'user' | 'auto',
+			sessionName?: string
+		) => Promise<boolean>;
+		updateSessionName: (
+			projectPath: string,
+			agentSessionId: string,
+			sessionName: string
+		) => Promise<boolean>;
+		updateSessionStarred: (
+			projectPath: string,
+			agentSessionId: string,
+			starred: boolean
+		) => Promise<boolean>;
+		updateSessionContextUsage: (
+			projectPath: string,
+			agentSessionId: string,
+			contextUsage: number
+		) => Promise<boolean>;
+		getSessionOrigins: (projectPath: string) => Promise<
+			Record<
+				string,
+				| 'user'
+				| 'auto'
+				| {
+						origin: 'user' | 'auto';
+						sessionName?: string;
+						starred?: boolean;
+						contextUsage?: number;
+				  }
+			>
+		>;
+		getAllNamedSessions: () => Promise<
+			Array<{
+				agentId: string;
+				agentSessionId: string;
+				projectPath: string;
+				sessionName: string;
+				starred?: boolean;
+				lastActivityAt?: number;
+			}>
+		>;
+		deleteMessagePair: (
+			projectPath: string,
+			sessionId: string,
+			userMessageUuid: string,
+			fallbackContent?: string
+		) => Promise<{ success: boolean; linesRemoved?: number; error?: string }>;
+		getSessionTimestamps: (projectPath: string) => Promise<{ timestamps: string[] }>;
+	};
+	tempfile: {
+		write: (
+			content: string,
+			filename?: string
+		) => Promise<{ success: boolean; path?: string; error?: string }>;
+		read: (filePath: string) => Promise<{ success: boolean; content?: string; error?: string }>;
+		delete: (filePath: string) => Promise<{ success: boolean; error?: string }>;
+	};
+	history: {
+		getAll: (
+			projectPath?: string,
+			sessionId?: string,
+			sharedContext?: { sshRemoteId: string; remoteCwd: string }
+		) => Promise<
+			Array<{
+				id: string;
+				type: HistoryEntryType;
+				timestamp: number;
+				summary: string;
+				fullResponse?: string;
+				agentSessionId?: string;
+				projectPath: string;
+				sessionId?: string;
+				sessionName?: string;
+				contextUsage?: number;
+				usageStats?: UsageStats;
+				success?: boolean;
+				elapsedTimeMs?: number;
+				validated?: boolean;
+				hostname?: string;
+			}>
+		>;
+		getAllPaginated: (options?: {
+			projectPath?: string;
+			sessionId?: string;
+			pagination?: { limit?: number; offset?: number };
+			lookbackHours?: number | null;
+			sharedContext?: { sshRemoteId: string; remoteCwd: string };
+			types?: HistoryEntryType[];
+			hostKey?: string | null;
+			/** Collapse Cue runs to one row per trigger (`groupCueEntries`). */
+			groupCue?: boolean;
+		}) => Promise<{
+			entries: Array<{
+				id: string;
+				type: HistoryEntryType;
+				timestamp: number;
+				summary: string;
+				fullResponse?: string;
+				agentSessionId?: string;
+				projectPath: string;
+				sessionId?: string;
+				sessionName?: string;
+				contextUsage?: number;
+				usageStats?: UsageStats;
+				success?: boolean;
+				elapsedTimeMs?: number;
+				validated?: boolean;
+				hostname?: string;
+			}>;
+			total: number;
+			limit: number;
+			offset: number;
+			hasMore: boolean;
+		}>;
+		/**
+		 * The individual runs behind one collapsed Cue row (`cueGroup.key`),
+		 * newest first. `lookbackHours` must match the window the group was
+		 * counted over, or the expander and the count disagree.
+		 */
+		getCueGroupRuns: (options: {
+			sessionId: string;
+			groupKey: string;
+			projectPath?: string;
+			lookbackHours?: number | null;
+			limit?: number;
+		}) => Promise<HistoryEntry[]>;
+		add: (
+			entry: {
+				id: string;
+				type: HistoryEntryType;
+				timestamp: number;
+				summary: string;
+				fullResponse?: string;
+				agentSessionId?: string;
+				projectPath: string;
+				sessionId?: string;
+				sessionName?: string;
+				contextUsage?: number;
+				usageStats?: UsageStats;
+				success?: boolean;
+				elapsedTimeMs?: number;
+				validated?: boolean;
+				hostname?: string;
+				sourceAgentName?: string;
+			},
+			sharedContext?: { sshRemoteId: string; remoteCwd: string }
+		) => Promise<boolean>;
+		clear: (projectPath?: string, sessionId?: string) => Promise<boolean>;
+		delete: (entryId: string, sessionId?: string) => Promise<boolean>;
+		update: (
+			entryId: string,
+			updates: {
+				validated?: boolean;
+				summary?: string;
+				fullResponse?: string;
+				sessionName?: string;
+			},
+			sessionId?: string
+		) => Promise<boolean>;
+		updateSessionName: (agentSessionId: string, sessionName: string) => Promise<number>;
+		getFilePath: (sessionId: string) => Promise<string | null>;
+		listSessions: () => Promise<string[]>;
+		getGraphData: (
+			sessionId: string,
+			bucketCount: number,
+			lookbackHours: number | null,
+			sharedContext?: { sshRemoteId: string; remoteCwd: string },
+			projectPath?: string
+		) => Promise<{
+			buckets: Array<import('../shared/history').GraphBucket>;
+			bucketCount: number;
+			earliestTimestamp: number;
+			latestTimestamp: number;
+			totalCount: number;
+			autoCount: number;
+			userCount: number;
+			cueCount: number;
+			agentCount: number;
+			hostCounts: Record<string, number>;
+			cached: boolean;
+		}>;
+		getOffsetForTimestamp: (
+			sessionId: string,
+			timestamp: number,
+			lookbackHours?: number | null,
+			types?: HistoryEntryType[]
+		) => Promise<number>;
+		onExternalChange: (handler: () => void) => () => void;
+		reload: () => Promise<boolean>;
+	};
+	notification: {
+		changeHistory: (
+			change: import('../shared/notificationHistory').NotificationHistoryChange
+		) => Promise<import('../shared/notificationHistory').NotificationHistorySnapshot>;
+		onHistoryChanged: (
+			callback: (
+				snapshot: import('../shared/notificationHistory').NotificationHistorySnapshot
+			) => void
+		) => () => void;
+		navigateToSource: (
+			sessionId: string,
+			tabId?: string,
+			action?: import('../shared/toastClickAction').ToastClickAction
+		) => Promise<{ success: boolean }>;
+		onActivateAction: (
+			callback: (
+				action: import('../shared/toastClickAction').ToastClickAction
+			) => boolean | Promise<boolean>
+		) => () => void;
+
+		show: (
+			title: string,
+			body: string,
+			sessionId?: string,
+			tabId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		speak: (
+			text: string,
+			command?: string,
+			vars?: {
+				agent?: string;
+				tab?: string;
+				group?: string;
+				task?: string;
+			}
+		) => Promise<{ success: boolean; notificationId?: number; error?: string }>;
+		stopSpeak: (notificationId: number) => Promise<{ success: boolean; error?: string }>;
+		onCommandCompleted: (handler: (notificationId: number) => void) => () => void;
+		/** @deprecated Use onCommandCompleted instead */
+		onTtsCompleted: (handler: (notificationId: number) => void) => () => void;
+	};
+	attachments: {
+		save: (
+			sessionId: string,
+			base64Data: string,
+			filename: string
+		) => Promise<{ success: boolean; path?: string; filename?: string; error?: string }>;
+		load: (
+			sessionId: string,
+			filename: string
+		) => Promise<{ success: boolean; dataUrl?: string; error?: string }>;
+		delete: (sessionId: string, filename: string) => Promise<{ success: boolean; error?: string }>;
+		list: (sessionId: string) => Promise<{ success: boolean; files: string[]; error?: string }>;
+		getPath: (sessionId: string) => Promise<{ success: boolean; path: string }>;
+	};
+	// Auto Run file operations
+	// SSH remote support: Core operations accept optional sshRemoteId for remote file operations
+	autorun: {
+		listDocs: (
+			folderPath: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			files: string[];
+			tree?: AutoRunTreeNode[];
+			error?: string;
+		}>;
+		readDoc: (
+			folderPath: string,
+			filename: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; content?: string; notFound?: boolean; error?: string }>;
+		writeDoc: (
+			folderPath: string,
+			filename: string,
+			content: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		saveImage: (
+			folderPath: string,
+			docName: string,
+			base64Data: string,
+			extension: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; relativePath?: string; error?: string }>;
+		deleteImage: (
+			folderPath: string,
+			relativePath: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		replaceImage: (
+			folderPath: string,
+			relativePath: string,
+			base64Data: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; relativePath?: string; error?: string }>;
+		listImages: (
+			folderPath: string,
+			docName: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			images?: Array<{ filename: string; relativePath: string }>;
+			error?: string;
+		}>;
+		deleteFolder: (projectPath: string) => Promise<{ success: boolean; error?: string }>;
+		// File watching for live updates
+		// For remote sessions (sshRemoteId provided), returns isRemote: true indicating polling should be used
+		watchFolder: (
+			folderPath: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; isRemote?: boolean; message?: string; error?: string }>;
+		unwatchFolder: (folderPath: string) => Promise<{ success: boolean; error?: string }>;
+		onFileChanged: (
+			handler: (data: { folderPath: string; filename: string; eventType: string }) => void
+		) => () => void;
+		// Backup operations for reset-on-completion documents (legacy)
+		createBackup: (
+			folderPath: string,
+			filename: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; backupFilename?: string; error?: string }>;
+		restoreBackup: (
+			folderPath: string,
+			filename: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		deleteBackups: (
+			folderPath: string,
+			sshRemoteId?: string
+		) => Promise<{ success: boolean; deletedCount?: number; error?: string }>;
+		// Working copy operations for reset-on-completion documents (preferred)
+		// Creates a copy in /Runs/ subdirectory: {name}-{timestamp}-loop-{N}.md
+		createWorkingCopy: (
+			folderPath: string,
+			filename: string,
+			loopNumber: number,
+			sshRemoteId?: string
+		) => Promise<{ workingCopyPath: string; originalPath: string }>;
+		// Playbook STATUS.json watching. Types reference the single canonical
+		// PlaybookStatus in shared/types via inline import (no redeclaration).
+		// `subscriberId` reference-counts the watcher: several agents can run Auto
+		// Run against one project, and the watch must survive any one of them
+		// finishing. `isRemote` declines the watch outright for SSH agents, whose
+		// STATUS.json lives on the remote host where chokidar cannot see it.
+		watchStatus: (
+			projectPath: string,
+			subscriberId: string,
+			isRemote?: boolean
+		) => Promise<{
+			status: import('../shared/types').PlaybookStatus | null;
+			watching: boolean;
+			isRemote?: boolean;
+			message?: string;
+		}>;
+		unwatchStatus: (projectPath: string, subscriberId: string) => Promise<Record<string, never>>;
+		onStatusChanged: (
+			handler: (data: {
+				projectPath: string;
+				status: import('../shared/types').PlaybookStatus | null;
+			}) => void
+		) => () => void;
+	};
+	// Playbooks API (saved batch run configurations)
+	playbooks: {
+		list: (sessionId: string) => Promise<{
+			success: boolean;
+			playbooks: Array<{
+				id: string;
+				name: string;
+				createdAt: number;
+				updatedAt: number;
+				documents: Array<{ filename: string; resetOnCompletion: boolean }>;
+				loopEnabled: boolean;
+				maxLoops?: number | null;
+				prompt: string;
+				worktreeSettings?: {
+					branchNameTemplate: string;
+					createPROnCompletion: boolean;
+					prTargetBranch?: string;
+				};
+			}>;
+			error?: string;
+		}>;
+		create: (
+			sessionId: string,
+			playbook: {
+				name: string;
+				documents: Array<{ filename: string; resetOnCompletion: boolean }>;
+				loopEnabled: boolean;
+				maxLoops?: number | null;
+				prompt: string;
+				taskSelectionMode?: 'task' | 'document';
+				worktreeSettings?: {
+					branchNameTemplate: string;
+					createPROnCompletion: boolean;
+					prTargetBranch?: string;
+				};
+			}
+		) => Promise<{ success: boolean; playbook?: any; error?: string }>;
+		update: (
+			sessionId: string,
+			playbookId: string,
+			updates: Partial<{
+				name: string;
+				documents: Array<{ filename: string; resetOnCompletion: boolean }>;
+				loopEnabled: boolean;
+				maxLoops?: number | null;
+				prompt: string;
+				taskSelectionMode?: 'task' | 'document';
+				updatedAt: number;
+				worktreeSettings?: {
+					branchNameTemplate: string;
+					createPROnCompletion: boolean;
+					prTargetBranch?: string;
+				};
+			}>
+		) => Promise<{ success: boolean; playbook?: any; error?: string }>;
+		delete: (
+			sessionId: string,
+			playbookId: string
+		) => Promise<{ success: boolean; error?: string }>;
+		deleteAll: (sessionId: string) => Promise<{ success: boolean; error?: string }>;
+		export: (
+			sessionId: string,
+			playbookId: string,
+			autoRunFolderPath: string
+		) => Promise<{ success: boolean; filePath?: string; error?: string }>;
+		import: (
+			sessionId: string,
+			autoRunFolderPath: string
+		) => Promise<{ success: boolean; playbook?: any; importedDocs?: string[]; error?: string }>;
+	};
+	// Marketplace API (browse and import playbooks from GitHub)
+	marketplace: {
+		getManifest: () => Promise<{
+			success: boolean;
+			manifest?: {
+				lastUpdated: string;
+				playbooks: Array<{
+					id: string;
+					title: string;
+					description: string;
+					category: string;
+					subcategory?: string;
+					author: string;
+					authorLink?: string;
+					tags?: string[];
+					lastUpdated: string;
+					path: string;
+					documents: Array<{
+						filename: string;
+						resetOnCompletion: boolean;
+					}>;
+					loopEnabled: boolean;
+					maxLoops?: number | null;
+					prompt: string | null;
+					source?: 'official' | 'local';
+				}>;
+			};
+			fromCache?: boolean;
+			cacheAge?: number;
+			error?: string;
+		}>;
+		refreshManifest: () => Promise<{
+			success: boolean;
+			manifest?: {
+				lastUpdated: string;
+				playbooks: Array<{
+					id: string;
+					title: string;
+					description: string;
+					category: string;
+					subcategory?: string;
+					author: string;
+					authorLink?: string;
+					tags?: string[];
+					lastUpdated: string;
+					path: string;
+					documents: Array<{
+						filename: string;
+						resetOnCompletion: boolean;
+					}>;
+					loopEnabled: boolean;
+					maxLoops?: number | null;
+					prompt: string | null;
+					source?: 'official' | 'local';
+				}>;
+			};
+			fromCache?: boolean;
+			error?: string;
+		}>;
+		getDocument: (
+			playbookPath: string,
+			filename: string
+		) => Promise<{
+			success: boolean;
+			content?: string;
+			error?: string;
+		}>;
+		getReadme: (playbookPath: string) => Promise<{
+			success: boolean;
+			content?: string | null;
+			error?: string;
+		}>;
+		importPlaybook: (
+			playbookId: string,
+			targetFolderName: string,
+			autoRunFolderPath: string,
+			sessionId: string,
+			sshRemoteId?: string
+		) => Promise<{
+			success: boolean;
+			playbook?: {
+				id: string;
+				name: string;
+				createdAt: number;
+				updatedAt: number;
+				documents: Array<{ filename: string; resetOnCompletion: boolean }>;
+				loopEnabled: boolean;
+				maxLoops?: number | null;
+				prompt: string;
+			};
+			importedDocs?: string[];
+			error?: string;
+		}>;
+		onManifestChanged: (handler: () => void) => () => void;
+	};
+	// Updates API
+	updates: {
+		check: (includePrerelease?: boolean) => Promise<{
+			currentVersion: string;
+			latestVersion: string;
+			updateAvailable: boolean;
+			assetsReady: boolean;
+			versionsBehind: number;
+			releases: Array<{
+				tag_name: string;
+				name: string;
+				body: string;
+				html_url: string;
+				published_at: string;
+			}>;
+			releasesUrl: string;
+			error?: string;
+		}>;
+		checkin: () => Promise<void>;
+		download: (targetTag?: string) => Promise<{ success: boolean; error?: string }>;
+		install: () => Promise<void>;
+		getStatus: () => Promise<{
+			status:
+				| 'idle'
+				| 'checking'
+				| 'available'
+				| 'not-available'
+				| 'downloading'
+				| 'downloaded'
+				| 'error';
+			info?: { version: string };
+			progress?: { percent: number; bytesPerSecond: number; total: number; transferred: number };
+			error?: string;
+		}>;
+		onStatus: (
+			callback: (status: {
+				status:
+					| 'idle'
+					| 'checking'
+					| 'available'
+					| 'not-available'
+					| 'downloading'
+					| 'downloaded'
+					| 'error';
+				info?: { version: string };
+				progress?: { percent: number; bytesPerSecond: number; total: number; transferred: number };
+				error?: string;
+			}) => void
+		) => () => void;
+		setAllowPrerelease: (allow: boolean) => Promise<void>;
+	};
+	// Debug Package API
+	debug: {
+		createPackage: (options?: DebugPackageOptions) => Promise<{
+			success: boolean;
+			path?: string;
+			filesIncluded: string[];
+			totalSizeBytes: number;
+			cancelled?: boolean;
+			error?: string;
+		}>;
+		previewPackage: () => Promise<{
+			success: boolean;
+			categories: Array<{
+				id: string;
+				name: string;
+				included: boolean;
+				sizeEstimate: string;
+			}>;
+			error?: string;
+		}>;
+		getAppStats: () => Promise<{
+			timestamp: number;
+			platform: NodeJS.Platform;
+			main: {
+				rss: number;
+				heapTotal: number;
+				heapUsed: number;
+				external: number;
+				arrayBuffers: number;
+			};
+			electronProcesses: Array<{
+				pid: number;
+				type: string;
+				name?: string;
+				serviceName?: string;
+				cpuPercent?: number;
+				workingSetBytes?: number;
+				peakWorkingSetBytes?: number;
+			}>;
+			managedProcesses: Array<{
+				sessionId: string;
+				toolType: string;
+				pid?: number;
+				isTerminal?: boolean;
+				isBatchMode: boolean;
+				startTime?: number;
+				rssBytes?: number;
+			}>;
+		}>;
+		// Performance profiling (Chromium contentTracing)
+		getProfilingStatus: () => Promise<{
+			success: boolean;
+			active: boolean;
+			startedAt: number;
+			elapsedMs: number;
+			categories: string[];
+			bufferPercent: number;
+			peakBufferPercent: number;
+			bufferSizeKb: number;
+			autoStopRequested: boolean;
+			error?: string;
+		}>;
+		startProfiling: () => Promise<{
+			success: boolean;
+			active: boolean;
+			startedAt: number;
+			elapsedMs: number;
+			categories: string[];
+			bufferPercent: number;
+			peakBufferPercent: number;
+			bufferSizeKb: number;
+			autoStopRequested: boolean;
+			error?: string;
+		}>;
+		stopProfiling: () => Promise<{
+			success: boolean;
+			path: string | null;
+			cancelled: boolean;
+			bundleSizeBytes: number;
+			traceSizeBytes: number;
+			durationMs: number;
+			peakBufferPercent?: number;
+			autoStopped?: boolean;
+			bufferExhausted?: boolean;
+			error?: string;
+		}>;
+		profilingRunInBackground: () => Promise<{ success: boolean }>;
+		// Stop + bundle to a temp .zip without a save dialog (for feedback attach)
+		stopProfilingToFile: () => Promise<{
+			success: boolean;
+			path: string;
+			bundleSizeBytes: number;
+			traceSizeBytes: number;
+			durationMs: number;
+			error?: string;
+		}>;
+		// Delete an abandoned temp trace zip from stopProfilingToFile
+		discardTrace: (filePath: string) => Promise<{ success: boolean }>;
+		onProfilingProgress: (
+			handler: (event: {
+				phase: 'stopping' | 'awaiting-save' | 'compressing' | 'done' | 'cancelled' | 'error';
+				percent?: number;
+				bytesProcessed?: number;
+				totalBytes?: number;
+				path?: string | null;
+				bundleSizeBytes?: number;
+				error?: string;
+			}) => void
+		) => () => void;
+		onProfilingAutoStopped: (
+			handler: (event: {
+				reason: 'buffer-full';
+				active: boolean;
+				startedAt: number;
+				elapsedMs: number;
+				categories: string[];
+				bufferPercent: number;
+				peakBufferPercent: number;
+				bufferSizeKb: number;
+				autoStopRequested: boolean;
+			}) => void
+		) => () => void;
+		simulateAuthExpiry: (payload: {
+			processSessionId: string;
+			agentId: string;
+			sshRemoteId?: string;
+			fromPipeline?: boolean;
+		}) => Promise<{ success: boolean }>;
+	};
+	// Sync API (custom storage location)
+	sync: {
+		getDefaultPath: () => Promise<string>;
+		getSettings: () => Promise<{ customSyncPath?: string }>;
+		getCurrentStoragePath: () => Promise<string>;
+		selectSyncFolder: () => Promise<string | null>;
+		setCustomPath: (customPath: string | null) => Promise<{
+			success: boolean;
+			migrated?: number;
+			errors?: string[];
+			requiresRestart?: boolean;
+			error?: string;
+		}>;
+	};
+	// CLI activity API
+	cli: {
+		getActivity: () => Promise<
+			Array<{
+				sessionId: string;
+				playbookId: string;
+				playbookName: string;
+				startedAt: number;
+				pid: number;
+				currentTask?: string;
+				currentDocument?: string;
+			}>
+		>;
+		onActivityChange: (handler: () => void) => () => void;
+	};
+	// Cross-Agent Dispatch API (@mentions)
+	crossAgent: {
+		/** Dispatch a cross-agent request; response streams back via onChunk. */
+		send: (
+			request: import('../shared/crossAgentTypes').CrossAgentSendRequest
+		) => Promise<{ requestId: string }>;
+		/** Stop every consult this source agent still has in flight (Stop button). */
+		cancel: (sourceSessionId: string) => Promise<{ canceled: number }>;
+		/** Subscribe to streamed cross-agent response chunks. Returns a cleanup fn. */
+		onChunk: (
+			handler: (chunk: import('../shared/crossAgentTypes').CrossAgentResponseChunk) => void
+		) => () => void;
+	};
+	// Group Chat API (multi-agent coordination)
+	groupChat: {
+		// Shared return shape for group chat methods (mirrors GroupChat from shared/group-chat-types.ts)
+		// Storage
+		create: (
+			name: string,
+			moderatorAgentId: string,
+			moderatorConfig?: {
+				customPath?: string;
+				customArgs?: string;
+				customEnvVars?: Record<string, string>;
+				enableMaestroP?: boolean;
+				maestroPMode?: 'interactive' | 'dynamic';
+				maestroPPath?: string;
+			},
+			requireIdleParticipants?: boolean
+		) => Promise<GroupChatData>;
+		list: () => Promise<Array<GroupChatData>>;
+		load: (id: string) => Promise<GroupChatData | null>;
+		delete: (id: string) => Promise<boolean>;
+		rename: (id: string, name: string) => Promise<GroupChatData>;
+		update: (
+			id: string,
+			updates: {
+				name?: string;
+				moderatorAgentId?: string;
+				moderatorConfig?: {
+					customPath?: string;
+					customArgs?: string;
+					customEnvVars?: Record<string, string>;
+					enableMaestroP?: boolean;
+					maestroPMode?: 'interactive' | 'dynamic';
+					maestroPPath?: string;
+				};
+				requireIdleParticipants?: boolean;
+			}
+		) => Promise<GroupChatData>;
+		archive: (id: string, archived: boolean) => Promise<GroupChatData>;
+		// Chat log
+		appendMessage: (id: string, from: string, content: string) => Promise<void>;
+		getMessages: (id: string) => Promise<
+			Array<{
+				timestamp: string;
+				from: string;
+				content: string;
+			}>
+		>;
+		saveImage: (id: string, imageData: string, filename: string) => Promise<string>;
+		// Moderator
+		startModerator: (id: string) => Promise<string>;
+		sendToModerator: (
+			id: string,
+			message: string,
+			images?: string[],
+			readOnly?: boolean
+		) => Promise<void>;
+		// Execution queue. The queue lives in MAIN, so every verb answers with the
+		// WHOLE state and main also broadcasts it on `onQueueState` - a client
+		// renders what it is told rather than its own private copy, which is what
+		// made a phone's queue invisible to the desktop.
+		submitMessage: (
+			id: string,
+			item: import('../shared/group-chat-types').GroupChatQueuedItem
+		) => Promise<import('../shared/group-chat-types').GroupChatQueueState>;
+		getQueue: (id: string) => Promise<import('../shared/group-chat-types').GroupChatQueueState>;
+		queueAdd: (
+			id: string,
+			item: import('../shared/group-chat-types').GroupChatQueuedItem
+		) => Promise<import('../shared/group-chat-types').GroupChatQueueState>;
+		// `refused` is true when the item is already in flight, so the caller can
+		// say why nothing moved instead of silently redrawing the row.
+		queueRemove: (
+			id: string,
+			itemId: string
+		) => Promise<{
+			state: import('../shared/group-chat-types').GroupChatQueueState;
+			refused: boolean;
+		}>;
+		queueReorder: (
+			id: string,
+			itemId: string,
+			toIndex: number
+		) => Promise<{
+			state: import('../shared/group-chat-types').GroupChatQueueState;
+			refused: boolean;
+		}>;
+		queueResume: (id: string) => Promise<import('../shared/group-chat-types').GroupChatQueueState>;
+		onQueueState: (
+			callback: (
+				groupChatId: string,
+				state: import('../shared/group-chat-types').GroupChatQueueState
+			) => void
+		) => () => void;
+		stopModerator: (id: string) => Promise<void>;
+		stopAll: (id: string) => Promise<void>;
+		reportAutoRunComplete: (
+			groupChatId: string,
+			participantName: string,
+			summary: string
+		) => Promise<void>;
+		getModeratorSessionId: (id: string) => Promise<string | null>;
+		// Participants
+		addParticipant: (
+			id: string,
+			name: string,
+			agentId: string,
+			cwd?: string
+		) => Promise<{
+			name: string;
+			agentId: string;
+			sessionId: string;
+			addedAt: number;
+		}>;
+		sendToParticipant: (
+			id: string,
+			name: string,
+			message: string,
+			images?: string[]
+		) => Promise<void>;
+		removeParticipant: (id: string, name: string) => Promise<GroupChatData | null>;
+		resetParticipantContext: (
+			id: string,
+			name: string,
+			cwd?: string
+		) => Promise<{ newAgentSessionId: string }>;
+		// History
+		getHistory: (id: string) => Promise<
+			Array<{
+				id: string;
+				timestamp: number;
+				summary: string;
+				participantName: string;
+				participantColor: string;
+				type: 'user' | 'delegation' | 'response' | 'synthesis' | 'error';
+				elapsedTimeMs?: number;
+				tokenCount?: number;
+				cost?: number;
+				fullResponse?: string;
+			}>
+		>;
+		addHistoryEntry: (
+			id: string,
+			entry: {
+				timestamp: number;
+				summary: string;
+				participantName: string;
+				participantColor: string;
+				type: 'user' | 'delegation' | 'response' | 'synthesis' | 'error';
+				elapsedTimeMs?: number;
+				tokenCount?: number;
+				cost?: number;
+				fullResponse?: string;
+			}
+		) => Promise<{
+			id: string;
+			timestamp: number;
+			summary: string;
+			participantName: string;
+			participantColor: string;
+			type: 'user' | 'delegation' | 'response' | 'synthesis' | 'error';
+			elapsedTimeMs?: number;
+			tokenCount?: number;
+			cost?: number;
+			fullResponse?: string;
+		}>;
+		deleteHistoryEntry: (groupChatId: string, entryId: string) => Promise<boolean>;
+		clearHistory: (id: string) => Promise<void>;
+		getHistoryFilePath: (id: string) => Promise<string | null>;
+		getImages: (id: string) => Promise<Record<string, string>>;
+		// Events
+		onMessage: (
+			callback: (
+				groupChatId: string,
+				message: {
+					timestamp: string;
+					from: string;
+					content: string;
+				}
+			) => void
+		) => () => void;
+		onStateChange: (
+			callback: (
+				groupChatId: string,
+				state: 'idle' | 'moderator-thinking' | 'agent-working'
+			) => void
+		) => () => void;
+		onParticipantsChanged: (
+			callback: (
+				groupChatId: string,
+				participants: Array<{
+					name: string;
+					agentId: string;
+					sessionId: string;
+					addedAt: number;
+				}>
+			) => void
+		) => () => void;
+		onModeratorUsage: (
+			callback: (
+				groupChatId: string,
+				usage: {
+					contextUsage: number;
+					totalCost: number;
+					tokenCount: number;
+				}
+			) => void
+		) => () => void;
+		onHistoryEntry: (
+			callback: (
+				groupChatId: string,
+				entry: {
+					id: string;
+					timestamp: number;
+					summary: string;
+					participantName: string;
+					participantColor: string;
+					type: 'user' | 'delegation' | 'response' | 'synthesis' | 'error';
+					elapsedTimeMs?: number;
+					tokenCount?: number;
+					cost?: number;
+					fullResponse?: string;
+				}
+			) => void
+		) => () => void;
+		onParticipantState: (
+			callback: (groupChatId: string, participantName: string, state: 'idle' | 'working') => void
+		) => () => void;
+		onParticipantLiveOutput: (
+			callback: (groupChatId: string, participantName: string, chunk: string) => void
+		) => () => void;
+		onModeratorSessionIdChanged: (
+			callback: (groupChatId: string, sessionId: string) => void
+		) => () => void;
+		onAutoRunTriggered: (
+			callback: (groupChatId: string, participantName: string, filename?: string) => void
+		) => () => void;
+		onAutoRunBatchComplete: (
+			callback: (groupChatId: string, participantName: string) => void
+		) => () => void;
+	};
+	// Leaderboard API
+	leaderboard: {
+		getInstallationId: () => Promise<string | null>;
+		submit: (data: {
+			email: string;
+			displayName: string;
+			githubUsername?: string;
+			twitterHandle?: string;
+			linkedinHandle?: string;
+			discordUsername?: string;
+			blueskyHandle?: string;
+			badgeLevel: number;
+			badgeName: string;
+			// Stats fields are optional for profile-only submissions (multi-device safe)
+			// When omitted, server keeps existing values instead of overwriting
+			cumulativeTimeMs?: number;
+			totalRuns?: number;
+			longestRunMs?: number;
+			longestRunDate?: string;
+			currentRunMs?: number;
+			theme?: string;
+			clientToken?: string;
+			authToken?: string;
+			// Keyboard mastery data (aligned with RunMaestro.ai server schema)
+			keyboardMasteryLevel?: number;
+			keyboardMasteryTitle?: string;
+			keyboardCoveragePercent?: number;
+			keyboardKeysUnlocked?: number;
+			keyboardTotalKeys?: number;
+			// Delta mode for multi-device aggregation
+			deltaMs?: number;
+			deltaRuns?: number;
+			// Installation tracking for multi-device differentiation
+			installationId?: string; // Unique GUID per Maestro installation (auto-injected by main process)
+			clientTotalTimeMs?: number; // Client's self-proclaimed total time (for discrepancy detection)
+			// What earned this time. Absent means 'auto-run' (older clients predate
+			// this field). Cue submissions are far more frequent, so the server keys
+			// off this to suppress per-submission Discord notifications.
+			source?: 'auto-run' | 'cue';
+		}) => Promise<{
+			success: boolean;
+			message: string;
+			pendingEmailConfirmation?: boolean;
+			error?: string;
+			authTokenRequired?: boolean;
+			requiresConfirmation?: boolean;
+			ranking?: {
+				cumulative: {
+					rank: number;
+					total: number;
+					previousRank: number | null;
+					improved: boolean;
+				};
+				longestRun?: {
+					rank: number;
+					total: number;
+					previousRank: number | null;
+					improved: boolean;
+				};
+			};
+			// Server-side totals for multi-device sync
+			serverTotals?: {
+				cumulativeTimeMs: number;
+				totalRuns: number;
+			};
+		}>;
+		pollAuthStatus: (clientToken: string) => Promise<{
+			status: 'pending' | 'confirmed' | 'expired' | 'error';
+			authToken?: string;
+			message?: string;
+			error?: string;
+		}>;
+		resendConfirmation: (data: { email: string; clientToken: string }) => Promise<{
+			success: boolean;
+			message?: string;
+			error?: string;
+		}>;
+		get: (options?: { limit?: number }) => Promise<{
+			success: boolean;
+			entries?: Array<{
+				rank: number;
+				displayName: string;
+				githubUsername?: string;
+				avatarUrl?: string;
+				badgeLevel: number;
+				badgeName: string;
+				cumulativeTimeMs: number;
+				totalRuns: number;
+			}>;
+			error?: string;
+		}>;
+		getLongestRuns: (options?: { limit?: number }) => Promise<{
+			success: boolean;
+			entries?: Array<{
+				rank: number;
+				displayName: string;
+				githubUsername?: string;
+				avatarUrl?: string;
+				longestRunMs: number;
+				runDate: string;
+			}>;
+			error?: string;
+		}>;
+		// Sync stats from server (for new device installations)
+		sync: (data: { email: string; authToken: string }) => Promise<{
+			success: boolean;
+			found: boolean;
+			message?: string;
+			error?: string;
+			errorCode?: 'EMAIL_NOT_CONFIRMED' | 'INVALID_TOKEN' | 'MISSING_FIELDS';
+			data?: {
+				displayName: string;
+				badgeLevel: number;
+				badgeName: string;
+				cumulativeTimeMs: number;
+				totalRuns: number;
+				longestRunMs: number | null;
+				longestRunDate: string | null;
+				keyboardLevel: number | null;
+				coveragePercent: number | null;
+				ranking: {
+					cumulative: { rank: number; total: number };
+					longestRun: { rank: number; total: number } | null;
+				};
+			};
+		}>;
+	};
+	speckit: {
+		getMetadata: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+		getPrompts: () => Promise<{
+			success: boolean;
+			commands?: Array<{
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			}>;
+			error?: string;
+		}>;
+		getCommand: (slashCommand: string) => Promise<{
+			success: boolean;
+			command?: {
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			};
+			error?: string;
+		}>;
+		savePrompt: (
+			id: string,
+			content: string
+		) => Promise<{
+			success: boolean;
+			error?: string;
+		}>;
+		resetPrompt: (id: string) => Promise<{
+			success: boolean;
+			prompt?: string;
+			error?: string;
+		}>;
+		refresh: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+	};
+	openspec: {
+		getMetadata: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+		getPrompts: () => Promise<{
+			success: boolean;
+			commands?: Array<{
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			}>;
+			error?: string;
+		}>;
+		getCommand: (slashCommand: string) => Promise<{
+			success: boolean;
+			command?: {
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			};
+			error?: string;
+		}>;
+		savePrompt: (
+			id: string,
+			content: string
+		) => Promise<{
+			success: boolean;
+			error?: string;
+		}>;
+		resetPrompt: (id: string) => Promise<{
+			success: boolean;
+			prompt?: string;
+			error?: string;
+		}>;
+		refresh: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+	};
+	bmad: {
+		getMetadata: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+		getPrompts: () => Promise<{
+			success: boolean;
+			commands?: Array<{
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			}>;
+			error?: string;
+		}>;
+		getCommand: (slashCommand: string) => Promise<{
+			success: boolean;
+			command?: {
+				id: string;
+				command: string;
+				description: string;
+				prompt: string;
+				isCustom: boolean;
+				isModified: boolean;
+			};
+			error?: string;
+		}>;
+		savePrompt: (
+			id: string,
+			content: string
+		) => Promise<{
+			success: boolean;
+			error?: string;
+		}>;
+		resetPrompt: (id: string) => Promise<{
+			success: boolean;
+			prompt?: string;
+			error?: string;
+		}>;
+		refresh: () => Promise<{
+			success: boolean;
+			metadata?: {
+				lastRefreshed: string;
+				commitSha: string;
+				sourceVersion: string;
+				sourceUrl: string;
+			};
+			error?: string;
+		}>;
+	};
+	// Stats tracking API (global AI interaction statistics)
+	stats: {
+		// Record a query event (interactive conversation turn)
+		// Shaped by the shared type rather than an inline copy - the copy had
+		// already drifted from the real event once, and a field the bridge does
+		// not declare is a field the renderer silently cannot send.
+		recordQuery: (event: Omit<QueryEvent, 'id'>) => Promise<string>;
+		// Start an Auto Run session (returns session ID)
+		startAutoRun: (session: {
+			sessionId: string;
+			agentType: string;
+			documentPath?: string;
+			startTime: number;
+			tasksTotal?: number;
+			projectPath?: string;
+		}) => Promise<string>;
+		// End an Auto Run session (update duration and completed count)
+		endAutoRun: (id: string, duration: number, tasksCompleted: number) => Promise<boolean>;
+		// Record an Auto Run task completion
+		recordAutoTask: (task: {
+			autoRunSessionId: string;
+			sessionId: string;
+			agentType: string;
+			taskIndex: number;
+			taskContent?: string;
+			startTime: number;
+			duration: number;
+			success: boolean;
+		}) => Promise<string>;
+		// Get query events with time range and optional filters
+		getStats: (
+			range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all',
+			filters?: {
+				agentType?: string;
+				source?: 'user' | 'auto';
+				projectPath?: string;
+				sessionId?: string;
+			}
+		) => Promise<
+			Array<{
+				id: string;
+				sessionId: string;
+				agentType: string;
+				source: 'user' | 'auto';
+				startTime: number;
+				duration: number;
+				projectPath?: string;
+				tabId?: string;
+			}>
+		>;
+		// Get Auto Run sessions within a time range
+		getAutoRunSessions: (range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all') => Promise<
+			Array<{
+				id: string;
+				sessionId: string;
+				agentType: string;
+				documentPath?: string;
+				startTime: number;
+				duration: number;
+				tasksTotal?: number;
+				tasksCompleted?: number;
+				projectPath?: string;
+			}>
+		>;
+		// Get tasks for a specific Auto Run session
+		getAutoRunTasks: (autoRunSessionId: string) => Promise<
+			Array<{
+				id: string;
+				autoRunSessionId: string;
+				sessionId: string;
+				agentType: string;
+				taskIndex: number;
+				taskContent?: string;
+				startTime: number;
+				duration: number;
+				success: boolean;
+			}>
+		>;
+		// Token & cost usage aggregate for the Tokens tab. Reads agent session
+		// transcripts; `force` bypasses the accessor's in-memory memo.
+		getTokenUsage: (
+			query?: import('../shared/tokenUsage').TokenUsageQuery,
+			force?: boolean
+		) => Promise<import('../shared/tokenUsage').TokenUsageAggregate>;
+		// Get aggregated stats for dashboard display
+		getAggregation: (
+			range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all'
+		) => Promise<StatsAggregation>;
+		// Interactive vs autonomous (Auto Run + Cue) totals, merged across the
+		// stats DB and the Cue DB. Defaults to all retained history.
+		getDelegationTotals: (
+			range?: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all'
+		) => Promise<import('../shared/delegation').DelegationTotals>;
+		// The same split bucketed by local-time day; empty days are omitted.
+		getDelegationByDay: (
+			range?: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all'
+		) => Promise<import('../shared/delegation').DelegationDay[]>;
+		// Export every stats table for a range: one JSON file, or a zip of CSVs
+		exportUsage: (
+			range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all',
+			format: import('../shared/stats-types').UsageExportFormat,
+			filePath: string
+		) => Promise<import('../shared/stats-types').UsageExportResult>;
+		// Subscribe to stats updates (for real-time dashboard refresh)
+		onStatsUpdate: (callback: () => void) => () => void;
+		// Clear old stats data (older than specified number of days)
+		clearOldData: (olderThanDays: number) => Promise<{
+			success: boolean;
+			deletedQueryEvents: number;
+			deletedAutoRunSessions: number;
+			deletedAutoRunTasks: number;
+			deletedSessionLifecycle: number;
+			error?: string;
+		}>;
+		// Get database size in bytes
+		getDatabaseSize: () => Promise<number>;
+		// Get earliest stat timestamp (null if no entries exist)
+		getEarliestTimestamp: () => Promise<number | null>;
+		// Record an image annotation save event
+		recordImageAnnotation: (createdAt: number) => Promise<string | null>;
+		// Record a keyboard shortcut firing (buckets into local-time day)
+		recordShortcutUsage: (firedAt: number) => Promise<string | null>;
+		// Get per-day shortcut usage counts within a time range
+		getShortcutUsageByDay: (
+			range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all'
+		) => Promise<Array<{ date: string; count: number }>>;
+		// Get total shortcut firings within a time range
+		getShortcutUsageTotal: (
+			range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all'
+		) => Promise<number>;
+		// Record session creation (launched)
+		recordResilience: (event: {
+			id: string;
+			sessionId: string;
+			agentType: string;
+			strategy: 'availability' | 'token-exhaustion';
+			outcome: 'recovered' | 'stopped';
+			startedAt: number;
+			resolvedAt: number;
+			retries: number;
+		}) => Promise<string | null>;
+		getResilience: (range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all') => Promise<
+			Array<{
+				id: string;
+				sessionId: string;
+				agentType: string;
+				strategy: 'availability' | 'token-exhaustion';
+				outcome: 'recovered' | 'stopped';
+				startedAt: number;
+				resolvedAt: number;
+				retries: number;
+			}>
+		>;
+		// Upsert one Auto Run wizard run (idempotent on run.id)
+		recordWizardRun: (run: {
+			id: string;
+			sessionId: string;
+			agentType: string;
+			surface: 'inline' | 'onboarding';
+			mode: 'new' | 'iterate';
+			outcome: 'in-progress' | 'generated' | 'abandoned';
+			startedAt: number;
+			endedAt: number;
+			exchanges: number;
+			documents: number;
+			tasks: number;
+			activeMs?: number;
+			projectPath?: string;
+		}) => Promise<string | null>;
+		getWizardRuns: (range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all') => Promise<
+			Array<{
+				id: string;
+				sessionId: string;
+				agentType: string;
+				surface: 'inline' | 'onboarding';
+				mode: 'new' | 'iterate';
+				outcome: 'in-progress' | 'generated' | 'abandoned';
+				startedAt: number;
+				endedAt: number;
+				exchanges: number;
+				documents: number;
+				tasks: number;
+				activeMs?: number;
+				projectPath?: string;
+			}>
+		>;
+		recordSessionCreated: (event: {
+			sessionId: string;
+			agentType: string;
+			projectPath?: string;
+			createdAt: number;
+			isRemote?: boolean;
+			isWorktree?: boolean;
+		}) => Promise<string | null>;
+		// Record session closure
+		recordSessionClosed: (sessionId: string, closedAt: number) => Promise<boolean>;
+		// Get session lifecycle events within a time range
+		getSessionLifecycle: (range: 'day' | 'week' | 'month' | 'quarter' | 'year' | 'all') => Promise<
+			Array<{
+				id: string;
+				sessionId: string;
+				agentType: string;
+				projectPath?: string;
+				createdAt: number;
+				closedAt?: number;
+				duration?: number;
+				isRemote?: boolean;
+			}>
+		>;
+		// Get initialization result (for showing database reset notification)
+		getInitializationResult: () => Promise<{
+			success: boolean;
+			wasReset: boolean;
+			backupPath?: string;
+			error?: string;
+			userMessage?: string;
+		} | null>;
+		// Clear initialization result (after user has acknowledged the notification)
+		clearInitializationResult: () => Promise<boolean>;
+	};
+	// Cue Stats API (Phase 03 - Cue Dashboard aggregation query)
+	// Throws 'CueStatsDisabled' when either encoreFeatures.usageStats or
+	// encoreFeatures.maestroCue is off; consumers should catch and render
+	// the "feature off" state.
+	cueStats: {
+		// `excludeTriggerTypes` drops the named raw event types (`time.heartbeat`,
+		// `file.changed`, ...) from every rollup in the payload except
+		// `triggerTypeOptions`, which always reports the unfiltered universe.
+		getAggregation: (
+			range: CueStatsTimeRange,
+			excludeTriggerTypes?: string[]
+		) => Promise<CueStatsAggregation>;
+		// Conductor time (ms) the retained Cue run history would have credited.
+		// Ungated, unlike getAggregation; resolves 0 when there is no history.
+		getHistoricalConductorCredit: () => Promise<number>;
+	};
+	// Document Graph API (file watching for graph visualization)
+	documentGraph: {
+		watchFolder: (rootPath: string) => Promise<{ success: boolean; error?: string }>;
+		unwatchFolder: (rootPath: string) => Promise<{ success: boolean; error?: string }>;
+		onFilesChanged: (
+			handler: (data: {
+				rootPath: string;
+				changes: Array<{
+					filePath: string;
+					eventType: 'add' | 'change' | 'unlink';
+				}>;
+			}) => void
+		) => () => void;
+	};
+	// Symphony API (token donations / open source contributions)
+	symphony: {
+		// Registry operations
+		getRegistry: (forceRefresh?: boolean) => Promise<{
+			success: boolean;
+			registry?: {
+				schemaVersion: '1.0';
+				lastUpdated: string;
+				repositories: Array<{
+					slug: string;
+					name: string;
+					description: string;
+					url: string;
+					category: string;
+					tags?: string[];
+					maintainer: { name: string; url?: string };
+					isActive: boolean;
+					featured?: boolean;
+					addedAt: string;
+				}>;
+			};
+			fromCache?: boolean;
+			cacheAge?: number;
+			error?: string;
+		}>;
+		getIssues: (
+			repoSlug: string,
+			forceRefresh?: boolean
+		) => Promise<{
+			success: boolean;
+			issues?: Array<{
+				number: number;
+				title: string;
+				body: string;
+				url: string;
+				htmlUrl: string;
+				author: string;
+				createdAt: string;
+				updatedAt: string;
+				documentPaths: Array<{
+					name: string;
+					path: string;
+					isExternal: boolean;
+				}>;
+				status: 'available' | 'in_progress' | 'completed';
+				claimedByPr?: {
+					number: number;
+					url: string;
+					author: string;
+					isDraft: boolean;
+				};
+			}>;
+			fromCache?: boolean;
+			cacheAge?: number;
+			error?: string;
+		}>;
+		getIssueCounts: (
+			repoSlugs: string[],
+			forceRefresh?: boolean
+		) => Promise<{
+			success: boolean;
+			counts?: Record<string, number>;
+			fromCache?: boolean;
+			cacheAge?: number;
+			error?: string;
+		}>;
+		// State operations
+		getState: () => Promise<{
+			success: boolean;
+			state?: {
+				active: Array<{
+					id: string;
+					repoSlug: string;
+					repoName: string;
+					issueNumber: number;
+					issueTitle: string;
+					localPath: string;
+					branchName: string;
+					draftPrNumber?: number;
+					draftPrUrl?: string;
+					startedAt: string;
+					status: string;
+					progress: {
+						totalDocuments: number;
+						completedDocuments: number;
+						currentDocument?: string;
+						totalTasks: number;
+						completedTasks: number;
+					};
+					tokenUsage: {
+						inputTokens: number;
+						outputTokens: number;
+						estimatedCost: number;
+					};
+					timeSpent: number;
+					sessionId: string;
+					agentType: string;
+					error?: string;
+				}>;
+				history: Array<{
+					id: string;
+					repoSlug: string;
+					repoName: string;
+					issueNumber: number;
+					issueTitle: string;
+					startedAt: string;
+					completedAt: string;
+					prUrl: string;
+					prNumber: number;
+					tokenUsage: {
+						inputTokens: number;
+						outputTokens: number;
+						totalCost: number;
+					};
+					timeSpent: number;
+					documentsProcessed: number;
+					tasksCompleted: number;
+					outcome?: 'merged' | 'closed' | 'open' | 'unknown';
+				}>;
+				stats: {
+					totalContributions: number;
+					totalDocumentsProcessed: number;
+					totalTasksCompleted: number;
+					totalTokensUsed: number;
+					totalTimeSpent: number;
+					estimatedCostDonated: number;
+					repositoriesContributed: string[];
+					firstContributionAt?: string;
+					lastContributionAt?: string;
+					currentStreak: number;
+					longestStreak: number;
+					lastContributionDate?: string;
+				};
+			};
+			error?: string;
+		}>;
+		getActive: () => Promise<{
+			success: boolean;
+			contributions?: Array<{
+				id: string;
+				repoSlug: string;
+				repoName: string;
+				issueNumber: number;
+				issueTitle: string;
+				localPath: string;
+				branchName: string;
+				draftPrNumber?: number;
+				draftPrUrl?: string;
+				startedAt: string;
+				status: string;
+				progress: {
+					totalDocuments: number;
+					completedDocuments: number;
+					currentDocument?: string;
+					totalTasks: number;
+					completedTasks: number;
+				};
+				tokenUsage: {
+					inputTokens: number;
+					outputTokens: number;
+					estimatedCost: number;
+				};
+				timeSpent: number;
+				sessionId: string;
+				agentType: string;
+				error?: string;
+			}>;
+			error?: string;
+		}>;
+		getCompleted: (limit?: number) => Promise<{
+			success: boolean;
+			contributions?: Array<{
+				id: string;
+				repoSlug: string;
+				repoName: string;
+				issueNumber: number;
+				issueTitle: string;
+				startedAt: string;
+				completedAt: string;
+				prUrl: string;
+				prNumber: number;
+				tokenUsage: {
+					inputTokens: number;
+					outputTokens: number;
+					totalCost: number;
+				};
+				timeSpent: number;
+				documentsProcessed: number;
+				tasksCompleted: number;
+				outcome?: 'merged' | 'closed' | 'open' | 'unknown';
+			}>;
+			error?: string;
+		}>;
+		getStats: () => Promise<{
+			success: boolean;
+			stats?: {
+				totalContributions: number;
+				totalDocumentsProcessed: number;
+				totalTasksCompleted: number;
+				totalTokensUsed: number;
+				totalTimeSpent: number;
+				estimatedCostDonated: number;
+				repositoriesContributed: string[];
+				firstContributionAt?: string;
+				lastContributionAt?: string;
+				currentStreak: number;
+				longestStreak: number;
+				lastContributionDate?: string;
+			};
+			error?: string;
+		}>;
+		// Contribution lifecycle
+		start: (params: {
+			repoSlug: string;
+			repoUrl: string;
+			repoName: string;
+			issueNumber: number;
+			issueTitle: string;
+			documentPaths: Array<{ name: string; path: string; isExternal: boolean }>;
+			agentType: string;
+			sessionId: string;
+			baseBranch?: string;
+			autoRunFolderPath?: string;
+		}) => Promise<{
+			success: boolean;
+			contributionId?: string;
+			localPath?: string;
+			branchName?: string;
+			error?: string;
+		}>;
+		registerActive: (params: {
+			contributionId: string;
+			repoSlug: string;
+			repoName: string;
+			issueNumber: number;
+			issueTitle: string;
+			localPath: string;
+			branchName: string;
+			sessionId: string;
+			agentType: string;
+			totalDocuments: number;
+			draftPrNumber?: number;
+			draftPrUrl?: string;
+		}) => Promise<{ success: boolean; error?: string }>;
+		updateStatus: (params: {
+			contributionId: string;
+			status?: string;
+			progress?: {
+				totalDocuments?: number;
+				completedDocuments?: number;
+				currentDocument?: string;
+				totalTasks?: number;
+				completedTasks?: number;
+			};
+			tokenUsage?: {
+				inputTokens?: number;
+				outputTokens?: number;
+				estimatedCost?: number;
+			};
+			timeSpent?: number;
+			error?: string;
+			draftPrNumber?: number;
+			draftPrUrl?: string;
+		}) => Promise<{ success: boolean; updated?: boolean; error?: string }>;
+		complete: (params: {
+			contributionId: string;
+			prBody?: string;
+			stats?: {
+				inputTokens: number;
+				outputTokens: number;
+				estimatedCost: number;
+				timeSpentMs: number;
+				documentsProcessed: number;
+				tasksCompleted: number;
+			};
+		}) => Promise<{
+			success: boolean;
+			prUrl?: string;
+			prNumber?: number;
+			error?: string;
+		}>;
+		cancel: (
+			contributionId: string,
+			cleanup?: boolean
+		) => Promise<{ success: boolean; cancelled?: boolean; error?: string }>;
+		checkPRStatuses: () => Promise<{
+			success: boolean;
+			checked?: number;
+			merged?: number;
+			closed?: number;
+			errors?: string[];
+			error?: string;
+		}>;
+		syncContribution: (contributionId: string) => Promise<{
+			success: boolean;
+			message?: string;
+			prCreated?: boolean;
+			prMerged?: boolean;
+			prClosed?: boolean;
+			error?: string;
+		}>;
+		// Cache operations
+		clearCache: () => Promise<{ success: boolean; cleared?: boolean; error?: string }>;
+		// Clone and contribution start helpers
+		cloneRepo: (params: {
+			repoUrl: string;
+			localPath: string;
+		}) => Promise<{ success: boolean; error?: string }>;
+		startContribution: (params: {
+			contributionId: string;
+			sessionId: string;
+			repoSlug: string;
+			issueNumber: number;
+			issueTitle: string;
+			localPath: string;
+			documentPaths: Array<{ name: string; path: string; isExternal: boolean }>;
+		}) => Promise<{
+			success: boolean;
+			branchName?: string;
+			draftPrNumber?: number;
+			draftPrUrl?: string;
+			autoRunPath?: string;
+			error?: string;
+		}>;
+		createDraftPR: (params: { contributionId: string; title: string; body: string }) => Promise<{
+			success: boolean;
+			prUrl?: string;
+			prNumber?: number;
+			error?: string;
+		}>;
+		fetchDocumentContent: (
+			url: string
+		) => Promise<{ success: boolean; content?: string; error?: string }>;
+		// Real-time updates
+		onUpdated: (callback: () => void) => () => void;
+		onContributionStarted: (
+			callback: (data: {
+				contributionId: string;
+				sessionId: string;
+				localPath: string;
+				branchName: string;
+			}) => void
+		) => () => void;
+		onPRCreated: (
+			callback: (data: { contributionId: string; prNumber: number; prUrl: string }) => void
+		) => () => void;
+	};
+
+	// Tab Naming API (automatic tab name generation)
+	tabNaming: {
+		generateTabName: (config: {
+			userMessage: string;
+			agentType: string;
+			cwd: string;
+			sessionSshRemoteConfig?: {
+				enabled: boolean;
+				remoteId: string | null;
+				workingDirOverride?: string;
+				syncHistory?: boolean;
+			};
+			// Session-level custom env vars, forwarded so naming inherits the same provider auth as the chat.
+			sessionCustomEnvVars?: Record<string, string>;
+			// Claude token-source selection, forwarded so tab naming honors TUI/Dynamic/API.
+			enableMaestroP?: boolean;
+			maestroPMode?: 'interactive' | 'dynamic';
+			maestroPPath?: string;
+		}) => Promise<string | null>;
+	};
+
+	// Tab lifecycle API (renderer -> main tab-close notification)
+	tabs: {
+		// Fire-and-forget: an AI tab was really removed (not snoozed, not left
+		// running as an orphan). Main retires anything scoped to that tab, e.g. an
+		// armed dispatch callback that would otherwise time out an hour later.
+		notifyAiTabClosed: (agentId: string, tabId: string) => void;
+	};
+
+	// AI Command API (plain-English request -> one shell command line)
+	aiCommand: {
+		suggest: (config: {
+			request: string;
+			agentType: string;
+			cwd: string;
+			isGitRepo?: boolean;
+			sessionSshRemoteConfig?: {
+				enabled: boolean;
+				remoteId: string | null;
+				workingDirOverride?: string;
+			};
+			sshRemoteName?: string;
+			customPath?: string;
+			customArgs?: string;
+			customEnvVars?: Record<string, string>;
+			customModel?: string;
+			customEffort?: string;
+			claudeTokenSource?: import('../shared/claudeTokenMode').ClaudeTokenSourceFields;
+			recentCommands?: {
+				command: string;
+				exitCode?: number;
+				status?: 'running' | 'finished' | 'cancelled';
+			}[];
+		}) => Promise<{ success: boolean; command?: string; error?: string }>;
+	};
+
+	// Director's Notes API (unified history + synopsis generation)
+	directorNotes: {
+		getUnifiedHistory: (options: {
+			lookbackDays: number;
+			filter?: HistoryEntryType | HistoryEntryType[] | null;
+			limit?: number;
+			offset?: number;
+			graphBucketCount?: number;
+		}) => Promise<{
+			entries: Array<{
+				id: string;
+				type: HistoryEntryType;
+				timestamp: number;
+				summary: string;
+				fullResponse?: string;
+				agentSessionId?: string;
+				sessionName?: string;
+				projectPath: string;
+				sessionId?: string;
+				contextUsage?: number;
+				success?: boolean;
+				elapsedTimeMs?: number;
+				validated?: boolean;
+				agentName?: string;
+				sourceSessionId: string;
+				usageStats?: UsageStats;
+			}>;
+			total: number;
+			limit: number;
+			offset: number;
+			hasMore: boolean;
+			stats: {
+				agentCount: number;
+				sessionCount: number;
+				autoCount: number;
+				userCount: number;
+				cueCount: number;
+				agentEntryCount: number;
+				totalCount: number;
+			};
+			graphBuckets?: Array<import('../shared/history').GraphBucket>;
+		}>;
+		getGraphData: (
+			bucketCount: number,
+			lookbackHours: number | null
+		) => Promise<{
+			buckets: Array<import('../shared/history').GraphBucket>;
+			bucketCount: number;
+			earliestTimestamp: number;
+			latestTimestamp: number;
+			totalCount: number;
+			autoCount: number;
+			userCount: number;
+			cueCount: number;
+			agentCount: number;
+			cached: boolean;
+			stats: {
+				agentCount: number;
+				sessionCount: number;
+				autoCount: number;
+				userCount: number;
+				cueCount: number;
+				agentEntryCount: number;
+				totalCount: number;
+			};
+		}>;
+		getOffsetForTimestamp: (
+			timestamp: number,
+			options?: {
+				lookbackDays?: number;
+				filter?: HistoryEntryType | HistoryEntryType[] | null;
+			}
+		) => Promise<number>;
+		/**
+		 * Deterministic Rich Mode stats computed in the main process over
+		 * history entries (never inferred by the AI synopsis).
+		 */
+		getRichOverviewStats: (options: { lookbackDays: number; bucketCount?: number }) => Promise<{
+			totalEntries: number;
+			agentCount: number;
+			sessionCount: number;
+			autoCount: number;
+			userCount: number;
+			cueCount: number;
+			agentEntryCount: number;
+			successCount: number;
+			failureCount: number;
+			successRate: number;
+			totalElapsedMs: number;
+			avgElapsedMs: number;
+			timelineBuckets: Array<{
+				startTime: number;
+				auto: number;
+				user: number;
+				cue: number;
+				agent: number;
+			}>;
+			perAgent: Array<{
+				sessionId: string;
+				agentName: string;
+				entryCount: number;
+				successCount: number;
+				failureCount: number;
+				/**
+				 * True when retention capped this count rather than the lookback
+				 * window, so the real total is larger and unknown. Optional: a
+				 * cached payload predating the field reads as "not truncated".
+				 */
+				truncated?: boolean;
+			}>;
+			lookbackDays: number;
+			generatedAt: number;
+		}>;
+		generateSynopsis: (options: {
+			lookbackDays: number;
+			provider: string;
+			customPath?: string;
+			customArgs?: string;
+			customEnvVars?: Record<string, string>;
+		}) => Promise<{
+			success: boolean;
+			synopsis: string;
+			generatedAt?: number;
+			stats?: {
+				agentCount: number;
+				entryCount: number;
+				durationMs: number;
+			};
+			error?: string;
+			/** Parsed structured narrative, from a clean parse or a salvage. */
+			narrative?: import('../shared/directorNotesNarrative').DirectorNotesNarrative;
+			/** Set when the raw synopsis could not be parsed into a structured narrative. */
+			narrativeError?: string;
+			/** Set when `narrative` was salvaged; explains what had to be recovered. */
+			narrativeRecovery?: string;
+		}>;
+		/** Subscribe to synopsis generation progress updates. Returns cleanup function. */
+		onSynopsisProgress: (
+			callback: (update: { chunkCount: number; bytesReceived: number; elapsedMs: number }) => void
+		) => () => void;
+		/** Subscribe to new history entries as they are added in real-time. Returns cleanup function. */
+		onHistoryEntryAdded: (
+			callback: (
+				entry: {
+					id: string;
+					type: HistoryEntryType;
+					timestamp: number;
+					summary: string;
+					fullResponse?: string;
+					agentSessionId?: string;
+					sessionName?: string;
+					projectPath: string;
+					sessionId?: string;
+					contextUsage?: number;
+					success?: boolean;
+					elapsedTimeMs?: number;
+					validated?: boolean;
+					usageStats?: UsageStats;
+				},
+				sourceSessionId: string
+			) => void
+		) => () => void;
+	};
+
+	// Cue API (event-driven automation)
+	cue: {
+		getSettings: () => Promise<CueSettings>;
+		saveSettings: (settings: CueSettings) => Promise<{ writtenRoots: string[] }>;
+		getStatus: () => Promise<CueSessionStatus[]>;
+		getGraphData: () => Promise<CueGraphSession[]>;
+		getActiveRuns: () => Promise<CueRunResult[]>;
+		getRunLiveOutput: (runId: string) => Promise<{ stdout: string; stderr: string } | null>;
+		getActivityLog: (limit?: number) => Promise<CueRunResult[]>;
+		getEventCount: () => Promise<number>;
+		enable: () => Promise<void>;
+		disable: () => Promise<void>;
+		/**
+		 * Visibility-aware pause. Flip to false while the app is hidden so
+		 * the Cue scanner subsystem skips expensive background work; flip
+		 * back to true on visibility. Different from `disable`, which tears
+		 * the engine down entirely.
+		 */
+		setActive: (active: boolean) => Promise<void>;
+		stopRun: (runId: string) => Promise<boolean>;
+		stopAll: () => Promise<void>;
+		triggerSubscription: (
+			subscriptionName: string,
+			prompt?: string,
+			sourceAgentId?: string
+		) => Promise<boolean>;
+		getQueueStatus: () => Promise<Record<string, number>>;
+		getMetrics: () => Promise<import('../main/cue/cue-metrics').CueMetrics | null>;
+		getFanInHealth: () => Promise<import('../main/cue/cue-fan-in-tracker').FanInHealthEntry[]>;
+		refreshSession: (sessionId: string, projectRoot: string) => Promise<void>;
+		removeSession: (sessionId: string) => Promise<void>;
+		listScheduledTasks: () => Promise<{
+			tasks: import('../shared/cue/scheduled-tasks').ScheduledTask[];
+			warnings: string[];
+		}>;
+		createScheduledTask: (
+			input: import('../shared/cue/scheduled-tasks').ScheduledTaskCreateInput
+		) => Promise<{ names: string[] }>;
+		updateScheduledTask: (
+			projectRoot: string,
+			name: string,
+			patch: import('../shared/cue/scheduled-tasks').ScheduledTaskUpdateInput
+		) => Promise<{ updated: boolean; reason?: string }>;
+		cancelScheduledTask: (
+			projectRoot: string,
+			name: string
+		) => Promise<{ removed: boolean; reason?: string }>;
+		readYaml: (projectRoot: string) => Promise<string | null>;
+		writeYaml: (
+			projectRoot: string,
+			content: string,
+			promptFiles?: Record<string, string>
+		) => Promise<{ changed: boolean }>;
+		deleteYaml: (projectRoot: string) => Promise<boolean>;
+		renamePipeline: (
+			oldName: string,
+			newName: string
+		) => Promise<{
+			renamed: boolean;
+			subscriptionsUpdated: number;
+			filesWritten: string[];
+			reason?: string;
+			warnings: string[];
+		}>;
+		validateYaml: (content: string) => Promise<{ valid: boolean; errors: string[] }>;
+		savePipelineLayout: (layout: Record<string, unknown>) => Promise<void>;
+		loadPipelineLayout: () => Promise<Record<string, unknown> | null>;
+		onActivityUpdate: (callback: (data: CueLogPayload) => void) => () => void;
+	};
+
+	// Cue Backup API (snapshot + restore for cue.yaml + Cue prompts)
+	cueBackup: {
+		create: () => Promise<import('../shared/cue-backup-types').CueBackupSummary>;
+		list: () => Promise<import('../shared/cue-backup-types').CueBackupSummary[]>;
+		inspect: (filePath: string) => Promise<import('../shared/cue-backup-types').CueBackupManifest>;
+		readFile: (
+			filePath: string,
+			workspaceId: string,
+			relativePath: string
+		) => Promise<string | null>;
+		readLive: (cwd: string, relativePath: string) => Promise<string | null>;
+		restoreFile: (filePath: string, workspaceId: string, relativePath: string) => Promise<void>;
+		restoreAll: (
+			filePath: string
+		) => Promise<import('../shared/cue-backup-types').CueBackupRestoreResult>;
+		getDiffStatus: (
+			filePath: string
+		) => Promise<import('../shared/cue-backup-types').CueBackupDiffStatusMap>;
+		delete: (filePath: string) => Promise<void>;
+	};
+
+	// Pianola API (autonomous manager: rules + decision log)
+	// All channels reject with 'PianolaDisabled' when the Encore flag is off.
+	pianola: {
+		getRules: () => Promise<RulesLoadResult>;
+		saveRules: (rules: PianolaRule[]) => Promise<PianolaRule[]>;
+		getDecisions: (limit?: number) => Promise<PianolaDecisionRecord[]>;
+		getSuggestions: () => Promise<PianolaSuggestionsFile>;
+		applySuggestion: (payload: {
+			rule?: PianolaRule;
+			profile?: { text: string; projectPath?: string };
+		}) => Promise<{ rules: PianolaRule[] }>;
+		supervisor: {
+			list: () => Promise<PianolaSupervisorSnapshot>;
+			add: (target: Partial<PianolaSupervisedTarget>) => Promise<PianolaSupervisorSnapshot>;
+			setEnabled: (id: string, enabled: boolean) => Promise<PianolaSupervisorSnapshot>;
+			remove: (id: string) => Promise<PianolaSupervisorSnapshot>;
+		};
+	};
+
+	// AgentRun API (neutral run/campaign ledger)
+	agentRun: AgentRunApi;
+
+	// Plugins API (community plugin subsystem: list/toggle/install/uninstall)
+	plugins: {
+		list: () => Promise<PluginListSnapshot>;
+		setEnabled: (id: string, enabled: boolean) => Promise<PluginListSnapshot>;
+		setFirstPartyEnabled: (
+			flag: FirstPartyEncoreFlag,
+			enabled: boolean
+		) => Promise<FirstPartyBridgeState>;
+		install: (sourceDir: string) => Promise<PluginInstallResult>;
+		update: (sourceDir: string) => Promise<PluginListSnapshot>;
+		uninstall: (id: string) => Promise<{ success: boolean; error?: string }>;
+		contributions: () => Promise<PluginContributions>;
+		getGrants: (id: string) => Promise<PluginGrantsSnapshot>;
+		requestConsent: (id: string) => Promise<{ opened: boolean }>;
+		revokeGrants: (id: string) => Promise<PluginGrantsSnapshot>;
+		setAgentAllowlist: (id: string, agentIds: string[]) => Promise<PluginGrantsSnapshot>;
+		invokeCommand: (commandId: string, args?: unknown) => Promise<{ dispatched: boolean }>;
+		invokeTool: (toolId: string, args?: unknown) => Promise<{ result: unknown }>;
+		getActivity: () => Promise<PluginActivityMap>;
+		getGroupings: () => Promise<PluginGroupingSnapshot>;
+		onChanged: (callback: () => void) => () => void;
+		onGroupingsChanged: (callback: () => void) => () => void;
+		onPanelData: (
+			callback: (payload: { pluginId: string; panelId: string; data: unknown }) => void
+		) => () => void;
+		onPanelVisibility: (
+			callback: (payload: {
+				pluginId: string;
+				panelId: string;
+				action: 'open' | 'close' | 'toggle';
+			}) => void
+		) => () => void;
+		onRunUiCommand: (
+			callback: (commandId: string, args: unknown) => boolean | Promise<boolean>
+		) => () => void;
+	};
+
+	// WakaTime API (CLI check, API key validation)
+	wakatime: {
+		checkCli: () => Promise<{ available: boolean; version?: string }>;
+		validateApiKey: (key: string) => Promise<{ valid: boolean }>;
+	};
+
+	// Maestro CLI API (status check + install/update)
+	maestroCli: {
+		checkStatus: () => Promise<MaestroCliStatus>;
+		installOrUpdate: () => Promise<MaestroCliInstallResult>;
+	};
+
+	prompts: {
+		get: (id: string) => Promise<{ success: boolean; content?: string; error?: string }>;
+		getAll: () => Promise<{
+			success: boolean;
+			prompts?: Array<{
+				id: string;
+				filename: string;
+				description: string;
+				category: string;
+				content: string;
+				isModified: boolean;
+				hasDefaultDrifted: boolean;
+			}>;
+			error?: string;
+		}>;
+		getAllIds: () => Promise<{ success: boolean; ids?: string[]; error?: string }>;
+		save: (id: string, content: string) => Promise<{ success: boolean; error?: string }>;
+		reset: (id: string) => Promise<{ success: boolean; content?: string; error?: string }>;
+		getBundledDefault: (
+			id: string
+		) => Promise<{ success: boolean; content?: string; error?: string }>;
+		getPath: () => Promise<{ success: boolean; path?: string; error?: string }>;
+		listFiles: () => Promise<{
+			success: boolean;
+			files?: Array<{ name: string; filename: string; isCatalog: boolean }>;
+			error?: string;
+		}>;
+	};
+
+	// Context Timeline capture log (main-side backfill of per-agent turn history)
+	contextTimeline: {
+		getCaptures: (sessionId: string | null) => Promise<{
+			success: boolean;
+			captures?: Array<{
+				seq: number;
+				timestamp: number;
+				sessionId: string;
+				usageStats: UsageStats;
+			}>;
+			trimmed?: boolean;
+			error?: string;
+		}>;
+		clearCaptures: (sessionId: string | null) => Promise<{ success: boolean; error?: string }>;
+	};
+
+	// Per-project memory API (Claude Code memory viewer)
+	memory: {
+		list: (
+			projectPath: string,
+			agentId?: string
+		) => Promise<{
+			success: boolean;
+			directoryPath?: string;
+			exists?: boolean;
+			entries?: Array<{
+				name: string;
+				size: number;
+				createdAt: string;
+				modifiedAt: string;
+			}>;
+			stats?: {
+				fileCount: number;
+				firstCreatedAt: string | null;
+				lastModifiedAt: string | null;
+				totalBytes: number;
+			};
+			error?: string;
+		}>;
+		read: (
+			projectPath: string,
+			filename: string,
+			agentId?: string
+		) => Promise<{ success: boolean; content?: string; error?: string }>;
+		write: (
+			projectPath: string,
+			filename: string,
+			content: string,
+			agentId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		create: (
+			projectPath: string,
+			filename: string,
+			content: string,
+			agentId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		delete: (
+			projectPath: string,
+			filename: string,
+			agentId?: string
+		) => Promise<{ success: boolean; error?: string }>;
+		search: (
+			projectPath: string,
+			query: string,
+			agentId?: string
+		) => Promise<{
+			success: boolean;
+			matches?: Array<{ name: string; matchedName: boolean; snippet?: string }>;
+			error?: string;
+		}>;
+		orphans: (
+			projectPath: string,
+			agentId?: string
+		) => Promise<{
+			success: boolean;
+			orphans?: string[];
+			brokenLinks?: { source: string; target: string }[];
+			error?: string;
+		}>;
+		getPath: (
+			projectPath: string,
+			agentId?: string
+		) => Promise<{ success: boolean; path?: string; error?: string }>;
+	};
+
+	// Coworking API (per-agent MCP installer + terminal registry sync)
+	coworking: {
+		getInstallStatus: () => Promise<
+			Array<{ agentId: string; configPath: string; installed: boolean }>
+		>;
+		install: (agentId: string) => Promise<void>;
+		uninstall: (agentId: string) => Promise<void>;
+		installAll: () => Promise<Array<{ agentId: string; ok: boolean; error?: string }>>;
+		syncSessionTerminals: (
+			sessionId: string,
+			records: Array<{
+				id: string;
+				cwd: string;
+				title: string;
+				tabUuid: string;
+				sessionId: string;
+			}>
+		) => Promise<void>;
+		removeSession: (sessionId: string) => Promise<void>;
+		onRequestBuffer: (
+			callback: (tabUuid: string, sessionId: string, responseChannel: string) => void
+		) => () => void;
+		sendBufferResponse: (responseChannel: string, content: string, ok?: boolean) => void;
+		syncSessionBrowsers: (
+			sessionId: string,
+			inputs: Array<{
+				tabUuid: string;
+				url: string;
+				title: string;
+				favicon?: string;
+				canGoBack: boolean;
+				canGoForward: boolean;
+				isLoading: boolean;
+				hiddenFromAgent?: boolean;
+			}>,
+			interactionEnabled: boolean,
+			agentType?: string,
+			confirmPolicy?: 'off' | 'dangerous' | 'all'
+		) => Promise<void>;
+		onRequestBrowserOp: (
+			callback: (
+				tabUuid: string,
+				sessionId: string,
+				op: BrowserOp,
+				responseChannel: string,
+				needsConfirm?: boolean
+			) => void
+		) => () => void;
+		sendBrowserOpResponse: (
+			responseChannel: string,
+			result: {
+				content?: string;
+				dataUrl?: string;
+				url?: string;
+				title?: string;
+				ok: boolean;
+			}
+		) => void;
+	};
+
+	// Browser Session API (clear per-partition browsing data of embedded browser tabs)
+	browserSession: {
+		clearSessionData: (partition: string) => Promise<{ ok: boolean; error?: string }>;
+	};
+	// Multi-window API - enumerate/create/focus/close windows and inspect or
+	// move the agents (sessions) each window owns. `sessionIds` are agent IDs.
+	windows: {
+		create: (
+			sessionIds?: string[],
+			bounds?: Partial<{
+				x: number;
+				y: number;
+				width: number;
+				height: number;
+				isMaximized: boolean;
+				isFullScreen: boolean;
+				sessionIds: string[];
+				activeSessionId: string | null;
+				leftPanelCollapsed: boolean;
+				rightPanelCollapsed: boolean;
+			}>
+		) => Promise<{
+			id: string;
+			isMain: boolean;
+			sessionIds: string[];
+			activeSessionId: string | null;
+			name?: string;
+		} | null>;
+		close: (windowId: string) => Promise<{ closed: boolean; error?: string }>;
+		list: () => Promise<
+			Array<{
+				id: string;
+				isMain: boolean;
+				sessionIds: string[];
+				activeSessionId: string | null;
+				name?: string;
+			}>
+		>;
+		getForSession: (sessionId: string) => Promise<string | null>;
+		moveSession: (
+			sessionId: string,
+			fromWindowId: string,
+			toWindowId: string
+		) => Promise<{ moved: boolean; error?: string }>;
+		focusWindow: (windowId: string) => Promise<{ focused: boolean; error?: string }>;
+		getState: () => Promise<{
+			id: string;
+			x: number;
+			y: number;
+			width: number;
+			height: number;
+			isMaximized: boolean;
+			isFullScreen: boolean;
+			sessionIds: string[];
+			activeSessionId: string | null;
+			leftPanelCollapsed: boolean;
+			rightPanelCollapsed: boolean;
+			name?: string;
+		} | null>;
+		// Claim a freshly-created agent for THIS window before its process starts,
+		// so it never momentarily surfaces in the primary's catch-all (spawn flicker).
+		registerSession: (sessionId: string) => Promise<{ registered: boolean }>;
+		// Persist the calling window's panel-collapse UI state (per-window).
+		setPanelState: (panel: {
+			leftPanelCollapsed?: boolean;
+			rightPanelCollapsed?: boolean;
+		}) => Promise<void>;
+		// Set (or clear, via empty string) a window's user-assigned name; persists.
+		setName: (windowId: string, name: string) => Promise<{ renamed: boolean }>;
+		getBounds: (
+			windowId?: string
+		) => Promise<{ x: number; y: number; width: number; height: number } | null>;
+		findWindowAtPoint: (screenX: number, screenY: number) => Promise<string | null>;
+		// Subscribe to session-ownership move broadcasts; returns an unsubscribe fn.
+		onSessionMoved: (
+			callback: (payload: {
+				type: 'session-moved' | 'sessions-changed' | 'name-changed' | 'removed';
+				windowId?: string;
+				sessionId?: string;
+				fromWindowId?: string;
+				toWindowId?: string;
+			}) => void
+		) => () => void;
+		// Toggle a target window's tab-bar drop-zone highlight during tab drag-out.
+		highlightDropZone: (windowId: string, active: boolean) => Promise<void>;
+		// Subscribe to drop-zone highlight pushes for THIS window; returns unsubscribe.
+		onHighlightDropZone: (
+			callback: (payload: { windowId: string; active: boolean }) => void
+		) => () => void;
+		// Subscribe to `maestro-cli window` requests (primary window only); returns unsubscribe.
+		onRemoteCommand: (
+			callback: (request: WindowCommandRequest, responseChannel: string) => void
+		) => () => void;
+		sendRemoteCommandResponse: (responseChannel: string, result: WindowCommandResult) => void;
+	};
+	/**
+	 * Session Images API. Pasted transcript images are stored content-addressed
+	 * on disk and referenced as `maestro-image://store/<sha>.<ext>` (loaded
+	 * directly by `<img src>` via the maestro-image protocol). `resolve` turns a
+	 * ref back into a data URL for consumers that need the raw bytes (export,
+	 * clipboard, replay).
+	 */
+	images: {
+		resolve: (ref: string) => Promise<string | null>;
+	};
+	/**
+	 * Codex `visualize` content references. `load` builds the isolated document
+	 * for one fragment and returns the id/revision to frame it by.
+	 */
+	codexVisualization: {
+		load: (
+			request: import('../shared/codexVisualization').CodexVisualizationLoadRequest
+		) => Promise<import('../shared/codexVisualization').CodexVisualizationLoadResult>;
+	};
+}
+
+declare global {
+	interface Window {
+		maestro: MaestroAPI;
+		maestroTest?: {
+			addToast: (
+				type: 'success' | 'info' | 'warning' | 'error',
+				title: string,
+				message: string
+			) => void;
+			showPromptTooLong: (usageStats: any) => void;
+		};
+	}
+}
+
+export {};

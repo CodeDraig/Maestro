@@ -1,0 +1,1170 @@
+/**
+ * useModalHandlers - Extracted from App.tsx (Phase 2C)
+ *
+ * Handles all modal open/close lifecycle callbacks, agent error recovery,
+ * lightbox navigation, celebration modals, leaderboard, quit confirmation,
+ * and quick-action modal openers.
+ *
+ * Reads from: useModalStore, useSettingsStore, useSessionStore,
+ *             useGroupChatStore, useAgentStore
+ *
+ * NOTE: getModalActions() calls are a legacy shim that wraps modalStore methods
+ * for backward compatibility. New code should prefer useModalStore.getState()
+ * directly. These will be migrated in a future cleanup pass.
+ */
+
+import { useCallback, useEffect, useMemo, useRef } from 'react';
+import type { Session, LeaderboardRegistration, AgentError } from '../../types';
+import type { RecoveryAction } from '../../components/AgentErrorModal';
+import { getModalActions, useModalStore } from '../../stores/modalStore';
+import { useSettingsStore } from '../../stores/settingsStore';
+import {
+	useSessionStore,
+	selectActiveSession,
+	selectSessionById,
+	updateSessionWith,
+} from '../../stores/sessionStore';
+import { useTabStore } from '../../stores/tabStore';
+import { useGroupChatStore } from '../../stores/groupChatStore';
+import { useAgentStore } from '../../stores/agentStore';
+import { reportAuthFailure } from '../../stores/authOutageStore';
+import { useFeedbackDraftStore } from '../../stores/feedbackDraftStore';
+import { useQuitWhenIdleStore } from '../../stores/quitWhenIdleStore';
+import { useAgentErrorRecovery } from '../agent/useAgentErrorRecovery';
+import { aiTabFocusFields } from '../../utils/tabHelpers';
+import { resolveActiveTabRef, resolveTabRefRenameValue } from '../../utils/panelLayout';
+import { CONDUCTOR_BADGES } from '../../constants/conductorBadges';
+import { gitService } from '../../services/git';
+import { cueService } from '../../services/cue';
+import { notifyCenterFlash } from '../../stores/centerFlashStore';
+import { useGitDetail } from '../../contexts/GitStatusContext';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface ModalHandlersReturn {
+	// Derived state
+	errorSession: Session | null;
+	/** The error to display - live session error or historical from chat log */
+	effectiveAgentError: AgentError | null;
+	recoveryActions: RecoveryAction[];
+	/**
+	 * When defined, jumps the Left Bar to the failing agent and activates the
+	 * failing AI tab. Undefined when not applicable (historical error, or the
+	 * user is already viewing the failing tab).
+	 */
+	handleJumpToFailingAgent?: () => void;
+
+	// Simple close handlers
+	handleCloseGitDiff: () => void;
+	handleCloseGitLog: () => void;
+	handleCloseSettings: () => void;
+	handleCloseDebugPackage: () => void;
+	handleCloseShortcutsHelp: () => void;
+	handleCloseAboutModal: () => void;
+	handleCloseUpdateCheckModal: () => void;
+	handleCloseFeedbackModal: () => void;
+	handleCloseProcessMonitor: () => void;
+	handleCloseLogViewer: () => void;
+	handleCloseConfirmModal: () => void;
+
+	// Session-related close handlers
+	handleCloseDeleteAgentModal: () => void;
+	handleCloseNewInstanceModal: () => void;
+	handleCloseEditAgentModal: () => void;
+	handleCloseRenameSessionModal: () => void;
+	handleCloseRenameTabModal: () => void;
+
+	// Quit handlers
+	handleConfirmQuit: () => void;
+	handleCancelQuit: () => void;
+	handleQuitWhenIdle: () => void;
+
+	// Celebration handlers
+	onKeyboardMasteryLevelUp: (level: number) => void;
+	handleKeyboardMasteryCelebrationClose: () => void;
+	handleStandingOvationClose: () => void;
+	handleFirstRunCelebrationClose: () => void;
+
+	// Leaderboard handlers
+	handleOpenLeaderboardRegistration: () => void;
+	handleOpenLeaderboardRegistrationFromAbout: () => void;
+	handleCloseLeaderboardRegistration: () => void;
+	handleSaveLeaderboardRegistration: (registration: LeaderboardRegistration) => void;
+	handleLeaderboardOptOut: () => void;
+
+	// Agent error handlers
+	handleCloseAgentErrorModal: () => void;
+	handleShowAgentErrorModal: (error?: AgentError) => void;
+	handleClearAgentError: (sessionId: string, tabId?: string) => void;
+	handleStartNewSessionAfterError: (sessionId: string) => void;
+	handleRetryAfterError: (sessionId: string) => void;
+	handleRestartAgentAfterError: (sessionId: string) => Promise<void>;
+	handleAuthenticateAfterError: (sessionId: string) => void;
+
+	// Open handlers
+	handleOpenQueueBrowser: () => void;
+	handleOpenTabSearch: () => void;
+	handleOpenCrossTabSearch: () => void;
+	handleOpenPromptComposer: () => void;
+	handleOpenFuzzySearch: () => void;
+	handleOpenCreatePR: () => void;
+	handleOpenAboutModal: () => void;
+	handleOpenFeedbackModal: () => void;
+	handleOpenBatchRunner: () => void;
+	handleOpenMarketplace: () => void;
+
+	// Session list openers
+	handleEditAgent: (session: Session) => void;
+	handleOpenCreatePRSession: (session: Session) => void;
+	handleConfigureCue: (session: Session) => void;
+
+	// Tour
+	handleStartTour: () => void;
+
+	// Lightbox
+	handleSetLightboxImage: (
+		image: string | null,
+		contextImages?: string[],
+		source?: 'staged' | 'history'
+	) => void;
+	handleCloseLightbox: () => void;
+	handleNavigateLightbox: (img: string) => void;
+	handleDeleteLightboxImage: (img: string) => void;
+	handleUpdateLightboxImage: (oldImg: string, newDataUrl: string) => void;
+
+	// Utility close handlers
+	handleCloseAutoRunSetup: () => void;
+	handleCloseBatchRunner: () => void;
+	handleCloseTabSwitcher: () => void;
+	handleCloseCrossTabSearch: () => void;
+	handleCloseFileSearch: () => void;
+	handleClosePromptComposer: () => void;
+	handleCloseCreatePRModal: () => void;
+	handleCloseSendToAgent: () => void;
+	handleCloseQueueBrowser: () => void;
+	handleCloseRenameGroupModal: () => void;
+
+	// Quick actions modal openers
+	handleQuickActionsRenameTab: () => void;
+	handleQuickActionsOpenTabSwitcher: () => void;
+	handleQuickActionsStartTour: () => void;
+	handleQuickActionsEditAgent: (session: Session) => void;
+	handleQuickActionsOpenMergeSession: () => void;
+	handleQuickActionsOpenSendToAgent: () => void;
+	handleQuickActionsOpenCreatePR: (session: Session) => void;
+
+	// LogViewer shortcut handler
+	handleLogViewerShortcutUsed: (shortcutId: string) => void;
+
+	// Git diff opener (Tier 3C)
+	handleViewGitDiff: () => Promise<void>;
+
+	// Director's Notes session navigation (Tier 3C)
+	handleDirectorNotesResumeSession: (
+		sourceSessionId: string,
+		agentSessionId: string,
+		sessionName?: string
+	) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Selectors
+// ---------------------------------------------------------------------------
+
+const selectAgentErrorSessionId = (s: ReturnType<typeof useModalStore.getState>) =>
+	s.getData('agentError')?.sessionId ?? null;
+const selectAgentErrorHistorical = (s: ReturnType<typeof useModalStore.getState>) =>
+	s.getData('agentError')?.historicalError ?? null;
+const selectLogViewerOpen = (s: ReturnType<typeof useModalStore.getState>) => s.isOpen('logViewer');
+const selectShortcutsHelpOpen = (s: ReturnType<typeof useModalStore.getState>) =>
+	s.isOpen('shortcutsHelp');
+
+// ---------------------------------------------------------------------------
+// Hook
+// ---------------------------------------------------------------------------
+
+export function useModalHandlers(
+	inputRef: React.RefObject<HTMLTextAreaElement | null>,
+	terminalOutputRef: React.RefObject<HTMLDivElement | null>,
+	// Third slot is `sessionName`; the second is `providedMessages` and is
+	// deliberately left to the resume itself to read from disk.
+	handleResumeSessionRef?: React.MutableRefObject<
+		((agentSessionId: string, providedMessages?: undefined, sessionName?: string) => void) | null
+	>,
+	groupChatInputRef?: React.RefObject<HTMLTextAreaElement | null>
+): ModalHandlersReturn {
+	// --- Reactive subscriptions (for derived state & effects) ---
+	const agentErrorModalSessionId = useModalStore(selectAgentErrorSessionId);
+	const historicalAgentError = useModalStore(selectAgentErrorHistorical);
+	const logViewerOpen = useModalStore(selectLogViewerOpen);
+	const shortcutsHelpOpen = useModalStore(selectShortcutsHelpOpen);
+	const settingsLoaded = useSettingsStore((s) => s.settingsLoaded);
+	const sessionsLoaded = useSessionStore((s) => s.sessionsLoaded);
+
+	// ====================================================================
+	// Derived State
+	// ====================================================================
+
+	const errorSessionSelector = useMemo(
+		() =>
+			agentErrorModalSessionId ? selectSessionById(agentErrorModalSessionId) : () => undefined,
+		[agentErrorModalSessionId]
+	);
+	const errorSession = useSessionStore(errorSessionSelector) ?? null;
+
+	// ====================================================================
+	// Group A: Simple Close Handlers
+	// ====================================================================
+
+	const handleCloseGitDiff = useCallback(() => {
+		getModalActions().setGitDiffPreview(null);
+	}, []);
+
+	const handleCloseGitLog = useCallback(() => {
+		getModalActions().setGitLogOpen(false);
+	}, []);
+
+	const handleCloseSettings = useCallback(() => {
+		getModalActions().setSettingsModalOpen(false);
+	}, []);
+
+	const handleCloseDebugPackage = useCallback(() => {
+		getModalActions().setDebugPackageModalOpen(false);
+	}, []);
+
+	const handleCloseShortcutsHelp = useCallback(() => {
+		getModalActions().setShortcutsHelpOpen(false);
+	}, []);
+
+	const handleCloseAboutModal = useCallback(() => {
+		getModalActions().setAboutModalOpen(false);
+	}, []);
+
+	const handleCloseFeedbackModal = useCallback(() => {
+		getModalActions().setFeedbackModalOpen(false);
+	}, []);
+
+	const handleCloseUpdateCheckModal = useCallback(() => {
+		getModalActions().setUpdateCheckModalOpen(false);
+	}, []);
+
+	const handleCloseProcessMonitor = useCallback(() => {
+		getModalActions().setProcessMonitorOpen(false);
+	}, []);
+
+	const handleCloseLogViewer = useCallback(() => {
+		getModalActions().setLogViewerOpen(false);
+	}, []);
+
+	const handleCloseConfirmModal = useCallback(() => {
+		getModalActions().setConfirmModalOpen(false);
+	}, []);
+
+	// ====================================================================
+	// Group B: Session-Related Close Handlers
+	// ====================================================================
+
+	const handleCloseDeleteAgentModal = useCallback(() => {
+		// setDeleteAgentSession(null) calls closeModal('deleteAgent') which clears both
+		// the open state and the session data - no separate setDeleteAgentModalOpen needed.
+		getModalActions().setDeleteAgentSession(null);
+	}, []);
+
+	const handleCloseNewInstanceModal = useCallback(() => {
+		getModalActions().setNewInstanceModalOpen(false);
+		getModalActions().setDuplicatingSessionId(null);
+	}, []);
+
+	const handleCloseEditAgentModal = useCallback(() => {
+		// setEditAgentSession(null) calls closeModal('editAgent') which clears both
+		// the open state and the session data - no separate setEditAgentModalOpen needed.
+		getModalActions().setEditAgentSession(null);
+	}, []);
+
+	const handleCloseRenameSessionModal = useCallback(() => {
+		getModalActions().setRenameInstanceModalOpen(false);
+		getModalActions().setRenameInstanceSessionId(null);
+	}, []);
+
+	const handleCloseRenameTabModal = useCallback(() => {
+		getModalActions().setRenameTabModalOpen(false);
+		getModalActions().setRenameTabId(null);
+	}, []);
+
+	// ====================================================================
+	// Group C: Quit Handlers
+	// ====================================================================
+
+	const handleConfirmQuit = useCallback(() => {
+		getModalActions().setQuitConfirmModalOpen(false);
+		window.maestro.app.confirmQuit();
+	}, []);
+
+	const handleCancelQuit = useCallback(() => {
+		getModalActions().setQuitConfirmModalOpen(false);
+		window.maestro.app.cancelQuit();
+	}, []);
+
+	// Defer the quit: close the modal, release this quit attempt so the app keeps
+	// running, and arm the idle watcher (useQuitWhenIdle) to quit once everything
+	// finishes.
+	const handleQuitWhenIdle = useCallback(() => {
+		getModalActions().setQuitConfirmModalOpen(false);
+		useQuitWhenIdleStore.getState().arm();
+		window.maestro.app.cancelQuit();
+	}, []);
+
+	// ====================================================================
+	// Group D: Celebration Handlers
+	// ====================================================================
+
+	const onKeyboardMasteryLevelUp = useCallback((level: number) => {
+		getModalActions().setPendingKeyboardMasteryLevel(level);
+	}, []);
+
+	const handleKeyboardMasteryCelebrationClose = useCallback(() => {
+		const pendingLevel = useModalStore.getState().getData('keyboardMastery')?.level ?? null;
+		if (pendingLevel !== null) {
+			useSettingsStore.getState().acknowledgeKeyboardMasteryLevel(pendingLevel);
+		}
+		getModalActions().setPendingKeyboardMasteryLevel(null);
+	}, []);
+
+	const handleStandingOvationClose = useCallback(() => {
+		const data = useModalStore.getState().getData('standingOvation');
+		if (data) {
+			useSettingsStore.getState().acknowledgeBadge(data.badge.level);
+		}
+		getModalActions().setStandingOvationData(null);
+	}, []);
+
+	const handleFirstRunCelebrationClose = useCallback(() => {
+		getModalActions().setFirstRunCelebrationData(null);
+	}, []);
+
+	const handleLogViewerShortcutUsed = useCallback(
+		(shortcutId: string) => {
+			const result = useSettingsStore.getState().recordShortcutUsage(shortcutId);
+			if (result.newLevel !== null) {
+				onKeyboardMasteryLevelUp(result.newLevel);
+			}
+			// Also bump the daily-firings counter so the Usage Dashboard bar
+			// chart includes shortcuts handled inside the System Log Viewer.
+			void window.maestro?.stats?.recordShortcutUsage?.(Date.now());
+		},
+		[onKeyboardMasteryLevelUp]
+	);
+
+	// ====================================================================
+	// Group E: Leaderboard Handlers
+	// ====================================================================
+
+	const handleOpenLeaderboardRegistration = useCallback(() => {
+		getModalActions().setLeaderboardRegistrationOpen(true);
+	}, []);
+
+	const handleOpenLeaderboardRegistrationFromAbout = useCallback(() => {
+		getModalActions().setAboutModalOpen(false);
+		getModalActions().setLeaderboardRegistrationOpen(true);
+	}, []);
+
+	const handleCloseLeaderboardRegistration = useCallback(() => {
+		getModalActions().setLeaderboardRegistrationOpen(false);
+	}, []);
+
+	const handleSaveLeaderboardRegistration = useCallback((registration: LeaderboardRegistration) => {
+		useSettingsStore.getState().setLeaderboardRegistration(registration);
+	}, []);
+
+	const handleLeaderboardOptOut = useCallback(() => {
+		useSettingsStore.getState().setLeaderboardRegistration(null);
+	}, []);
+
+	// ====================================================================
+	// Group F: Agent Error Handlers
+	// ====================================================================
+
+	const handleCloseAgentErrorModal = useCallback(() => {
+		getModalActions().setAgentErrorModalSessionId(null);
+	}, []);
+
+	const handleShowAgentErrorModal = useCallback((historicalError?: AgentError) => {
+		const { sessions: currentSessions, activeSessionId } = useSessionStore.getState();
+		const currentSession = currentSessions.find((s) => s.id === activeSessionId);
+		if (!currentSession) return;
+
+		if (historicalError) {
+			// Show a historical error from a chat log entry
+			getModalActions().showHistoricalAgentError(currentSession.id, historicalError);
+		} else {
+			// Show the current live error on the active tab
+			const activeTab = currentSession.aiTabs.find((t) => t.id === currentSession.activeTabId);
+			if (!activeTab?.agentError) return;
+			getModalActions().setAgentErrorModalSessionId(currentSession.id);
+		}
+	}, []);
+
+	const handleClearAgentError = useCallback((sessionId: string, tabId?: string) => {
+		useAgentStore.getState().clearAgentError(sessionId, tabId);
+		getModalActions().setAgentErrorModalSessionId(null);
+	}, []);
+
+	const handleStartNewSessionAfterError = useCallback(
+		(sessionId: string) => {
+			const { defaultSaveToHistory, defaultShowThinking } = useSettingsStore.getState();
+			useAgentStore.getState().startNewSessionAfterError(sessionId, {
+				saveToHistory: defaultSaveToHistory,
+				showThinking: defaultShowThinking,
+			});
+			getModalActions().setAgentErrorModalSessionId(null);
+			setTimeout(() => inputRef.current?.focus(), 0);
+		},
+		[inputRef]
+	);
+
+	const handleRetryAfterError = useCallback(
+		(sessionId: string) => {
+			useAgentStore.getState().retryAfterError(sessionId);
+			getModalActions().setAgentErrorModalSessionId(null);
+			setTimeout(() => inputRef.current?.focus(), 0);
+		},
+		[inputRef]
+	);
+
+	const handleRestartAgentAfterError = useCallback(
+		async (sessionId: string) => {
+			await useAgentStore.getState().restartAgentAfterError(sessionId);
+			getModalActions().setAgentErrorModalSessionId(null);
+			setTimeout(() => inputRef.current?.focus(), 0);
+		},
+		[inputRef]
+	);
+
+	// Hand off to the re-authentication terminal rather than the bare terminal
+	// tab: the login flow finishes inside the modal, so the user never has to
+	// remember the provider's login command. Registering the failure first is
+	// what scopes the dialog to the provider and puts this agent on the list to
+	// resume - reached when the user opens a historical error by hand, so the
+	// outage may not exist yet.
+	const handleAuthenticateAfterError = useCallback((sessionId: string) => {
+		const session = selectSessionById(sessionId)(useSessionStore.getState());
+		const { providerKey } = reportAuthFailure({
+			sessionId,
+			message: session?.agentError?.message ?? 'The provider rejected the stored credentials.',
+			tabId: session?.agentErrorTabId,
+		});
+		useAgentStore.getState().authenticateAfterError(sessionId);
+		getModalActions().setAgentErrorModalSessionId(null);
+		if (providerKey) getModalActions().openReauthModal({ providerKey });
+	}, []);
+
+	// Determine the effective error: historical wins when explicitly requested (user clicked Details),
+	// otherwise fall back to live session error
+	const isHistorical = !!historicalAgentError;
+	const effectiveError = isHistorical
+		? historicalAgentError
+		: (errorSession?.agentError ?? undefined);
+
+	// Use the agent error recovery hook to get recovery actions
+	// Historical errors get no recovery actions (they're read-only)
+	const { recoveryActions } = useAgentErrorRecovery({
+		error: effectiveError,
+		agentId: errorSession?.toolType || 'claude-code',
+		sessionId: errorSession?.id || '',
+		onNewSession:
+			!isHistorical && errorSession
+				? () => handleStartNewSessionAfterError(errorSession.id)
+				: undefined,
+		onRetry:
+			!isHistorical && errorSession ? () => handleRetryAfterError(errorSession.id) : undefined,
+		onClearError:
+			!isHistorical && errorSession ? () => handleClearAgentError(errorSession.id) : undefined,
+		onRestartAgent:
+			!isHistorical && errorSession
+				? () => handleRestartAgentAfterError(errorSession.id)
+				: undefined,
+		onAuthenticate:
+			!isHistorical && errorSession
+				? () => handleAuthenticateAfterError(errorSession.id)
+				: undefined,
+	});
+
+	// ====================================================================
+	// Group G: Simple Open Handlers
+	// ====================================================================
+
+	const handleOpenQueueBrowser = useCallback(() => {
+		getModalActions().setQueueBrowserOpen(true);
+	}, []);
+
+	const handleOpenTabSearch = useCallback(() => {
+		getModalActions().setTabSwitcherOpen(true);
+	}, []);
+
+	const handleOpenCrossTabSearch = useCallback(() => {
+		getModalActions().setCrossTabSearchOpen(true);
+	}, []);
+
+	const handleOpenPromptComposer = useCallback(() => {
+		getModalActions().setPromptComposerOpen(true);
+	}, []);
+
+	const handleOpenFuzzySearch = useCallback(() => {
+		getModalActions().setFuzzyFileSearchOpen(true);
+	}, []);
+
+	const handleOpenCreatePR = useCallback(() => {
+		getModalActions().setCreatePRModalOpen(true);
+	}, []);
+
+	const handleOpenAboutModal = useCallback(() => {
+		getModalActions().setAboutModalOpen(true);
+	}, []);
+
+	const handleOpenFeedbackModal = useCallback(() => {
+		// If the modal is minimized to the sidebar Feedback button, restore it
+		// instead of opening a fresh one (preserves the in-flight draft).
+		const draft = useFeedbackDraftStore.getState();
+		// Refresh the persisted drafts list so it is current when the modal opens.
+		void draft.loadDrafts();
+		if (draft.isMinimized) {
+			draft.setMinimized(false);
+			return;
+		}
+		getModalActions().setFeedbackModalOpen(true);
+	}, []);
+
+	const handleOpenBatchRunner = useCallback(() => {
+		getModalActions().setBatchRunnerModalOpen(true);
+	}, []);
+
+	const handleOpenMarketplace = useCallback(() => {
+		getModalActions().setMarketplaceModalOpen(true);
+	}, []);
+
+	// ====================================================================
+	// Group H: Session List Modal Openers
+	// ====================================================================
+
+	const handleEditAgent = useCallback((session: Session) => {
+		getModalActions().setEditAgentSession(session);
+	}, []);
+
+	const handleOpenCreatePRSession = useCallback((session: Session) => {
+		getModalActions().setCreatePRSession(session);
+	}, []);
+
+	const handleConfigureCue = useCallback(async (session: Session) => {
+		// Pick the initial tab from whether THIS agent already has Cue config:
+		// an agent that is already wired up lands on the Dashboard, one that is
+		// not lands in the Pipeline Graph where its first pipeline gets built.
+		// Asking "does *any* agent have config" instead dumps someone who just
+		// right-clicked a fresh agent onto a dashboard that says nothing about
+		// it. Falls back to 'pipeline' if the status query fails - first-run is
+		// the safer landing for a user who has nothing configured yet.
+		let initialTab: 'dashboard' | 'pipeline' = 'pipeline';
+		try {
+			const sessions = await cueService.getStatus();
+			if (sessions.some((s) => s.sessionId === session.id)) initialTab = 'dashboard';
+		} catch {
+			initialTab = 'pipeline';
+		}
+		// The dashboard lists every Cue-enabled agent. Carrying the id through is
+		// what lets it mark the row the user actually right-clicked.
+		getModalActions().openCueModalWithTab(initialTab, session.id);
+	}, []);
+
+	// ====================================================================
+	// Group I: Tour Handler
+	// ====================================================================
+
+	const handleStartTour = useCallback(() => {
+		getModalActions().setTourFromWizard(false);
+		getModalActions().setTourOpen(true);
+	}, []);
+
+	// ====================================================================
+	// Group J: Lightbox Handlers
+	// ====================================================================
+
+	const handleSetLightboxImage = useCallback(
+		(image: string | null, contextImages?: string[], source: 'staged' | 'history' = 'history') => {
+			const { activeGroupChatId } = useGroupChatStore.getState();
+			const actions = getModalActions();
+			// setLightboxImage opens the modal - must be called first so that
+			// subsequent updateModalData calls (isGroupChat, allowDelete) find an active modal.
+			actions.setLightboxImage(image);
+			actions.setLightboxIsGroupChat(activeGroupChatId !== null);
+			actions.setLightboxAllowDelete(source === 'staged');
+			actions.setLightboxImages(contextImages || []);
+			actions.setLightboxSource(source);
+		},
+		[]
+	);
+
+	const handleCloseLightbox = useCallback(() => {
+		const actions = getModalActions();
+		actions.setLightboxImage(null);
+		actions.setLightboxImages([]);
+		actions.setLightboxSource('history');
+		actions.setLightboxIsGroupChat(false);
+		actions.setLightboxAllowDelete(false);
+		setTimeout(() => inputRef.current?.focus(), 0);
+	}, [inputRef]);
+
+	const handleNavigateLightbox = useCallback((img: string) => {
+		getModalActions().setLightboxImage(img);
+	}, []);
+
+	const handleDeleteLightboxImage = useCallback((img: string) => {
+		const lightboxData = useModalStore.getState().getData('lightbox');
+		const isGroupChat = lightboxData?.isGroupChat ?? false;
+
+		if (isGroupChat) {
+			useGroupChatStore
+				.getState()
+				.setGroupChatStagedImages((prev) => prev.filter((i) => i !== img));
+		} else {
+			// Update staged images for active tab in session store
+			const { sessions: currentSessions, activeSessionId } = useSessionStore.getState();
+			const session = currentSessions.find((s) => s.id === activeSessionId);
+			if (session) {
+				useSessionStore.getState().setSessions((prev) =>
+					prev.map((s) => {
+						if (s.id !== session.id) return s;
+						return {
+							...s,
+							aiTabs: s.aiTabs.map((tab) => {
+								if (tab.id !== s.activeTabId) return tab;
+								return {
+									...tab,
+									stagedImages: (tab.stagedImages || []).filter((i) => i !== img),
+								};
+							}),
+						};
+					})
+				);
+			}
+		}
+
+		// Update lightbox images so navigation stays in sync
+		const currentImages = lightboxData?.images ?? [];
+		getModalActions().setLightboxImages(currentImages.filter((i) => i !== img));
+	}, []);
+
+	const handleUpdateLightboxImage = useCallback((oldImg: string, newDataUrl: string) => {
+		const lightboxData = useModalStore.getState().getData('lightbox');
+		const isGroupChat = lightboxData?.isGroupChat ?? false;
+
+		if (isGroupChat) {
+			useGroupChatStore
+				.getState()
+				.setGroupChatStagedImages((prev) => prev.map((i) => (i === oldImg ? newDataUrl : i)));
+		} else {
+			const { sessions: currentSessions, activeSessionId } = useSessionStore.getState();
+			const session = currentSessions.find((s) => s.id === activeSessionId);
+			if (session) {
+				useSessionStore.getState().setSessions((prev) =>
+					prev.map((s) => {
+						if (s.id !== session.id) return s;
+						return {
+							...s,
+							aiTabs: s.aiTabs.map((tab) => {
+								if (tab.id !== s.activeTabId) return tab;
+								return {
+									...tab,
+									stagedImages: (tab.stagedImages || []).map((i) =>
+										i === oldImg ? newDataUrl : i
+									),
+								};
+							}),
+						};
+					})
+				);
+			}
+		}
+
+		const currentImages = lightboxData?.images ?? [];
+		getModalActions().setLightboxImages(currentImages.map((i) => (i === oldImg ? newDataUrl : i)));
+	}, []);
+
+	// ====================================================================
+	// Group K: Utility Close Handlers
+	// ====================================================================
+
+	const handleCloseAutoRunSetup = useCallback(() => {
+		getModalActions().setAutoRunSetupModalOpen(false);
+	}, []);
+
+	const handleCloseBatchRunner = useCallback(() => {
+		getModalActions().setBatchRunnerModalOpen(false);
+	}, []);
+
+	const handleCloseTabSwitcher = useCallback(() => {
+		getModalActions().setTabSwitcherOpen(false);
+	}, []);
+
+	const handleCloseCrossTabSearch = useCallback(() => {
+		getModalActions().setCrossTabSearchOpen(false);
+	}, []);
+
+	const handleCloseFileSearch = useCallback(() => {
+		getModalActions().setFuzzyFileSearchOpen(false);
+	}, []);
+
+	const handleClosePromptComposer = useCallback(() => {
+		getModalActions().setPromptComposerOpen(false);
+		// The composer serves both the agent composer and a group chat room, so
+		// hand the caret back to whichever one is actually on screen. The AI
+		// input isn't rendered while a room is open, so focusing it there lands
+		// the caret nowhere and the next keystroke goes to the document.
+		const inGroupChat = useGroupChatStore.getState().activeGroupChatId !== null;
+		const targetRef = inGroupChat && groupChatInputRef ? groupChatInputRef : inputRef;
+		setTimeout(() => targetRef.current?.focus(), 0);
+	}, [inputRef, groupChatInputRef]);
+
+	const handleCloseCreatePRModal = useCallback(() => {
+		getModalActions().setCreatePRModalOpen(false);
+		getModalActions().setCreatePRSession(null);
+	}, []);
+
+	const handleCloseSendToAgent = useCallback(() => {
+		getModalActions().setSendToAgentModalOpen(false);
+		// Drop any queued terminal-buffer send so it doesn't bleed into the next open
+		useTabStore.getState().setPendingTerminalBufferSend(null);
+	}, []);
+
+	const handleCloseQueueBrowser = useCallback(() => {
+		getModalActions().setQueueBrowserOpen(false);
+	}, []);
+
+	const handleCloseRenameGroupModal = useCallback(() => {
+		getModalActions().setRenameGroupModalOpen(false);
+	}, []);
+
+	// ====================================================================
+	// Group M: Quick Actions Modal Openers
+	// ====================================================================
+
+	const handleQuickActionsRenameTab = useCallback(() => {
+		const { sessions: currentSessions, activeSessionId } = useSessionStore.getState();
+		const currentSession = currentSessions.find((s) => s.id === activeSessionId);
+		if (!currentSession) return;
+
+		// Same target resolution as the Cmd+Shift+R shortcut: the focused pane when a
+		// tiled group is active, else the visible single-view tab.
+		const renameRef = resolveActiveTabRef(currentSession);
+		if (!renameRef) return;
+		const renameValue = resolveTabRefRenameValue(currentSession, renameRef);
+		if (renameValue === null) return;
+
+		const actions = getModalActions();
+		actions.setRenameTabId(renameRef.id);
+		actions.setRenameTabInitialName(renameValue);
+		actions.setRenameTabModalOpen(true);
+	}, []);
+
+	const handleQuickActionsOpenTabSwitcher = useCallback(() => {
+		const { sessions: currentSessions, activeSessionId } = useSessionStore.getState();
+		const currentSession = currentSessions.find((s) => s.id === activeSessionId);
+		if (currentSession?.aiTabs) {
+			getModalActions().setTabSwitcherOpen(true);
+		}
+	}, []);
+
+	const handleQuickActionsStartTour = useCallback(() => {
+		getModalActions().setTourFromWizard(false);
+		getModalActions().setTourOpen(true);
+	}, []);
+
+	const handleQuickActionsEditAgent = useCallback((session: Session) => {
+		getModalActions().setEditAgentSession(session);
+	}, []);
+
+	const handleQuickActionsOpenMergeSession = useCallback(() => {
+		getModalActions().setMergeSessionModalOpen(true);
+	}, []);
+
+	const handleQuickActionsOpenSendToAgent = useCallback(() => {
+		getModalActions().setSendToAgentModalOpen(true);
+	}, []);
+
+	const handleQuickActionsOpenCreatePR = useCallback((session: Session) => {
+		getModalActions().setCreatePRSession(session);
+	}, []);
+
+	// ====================================================================
+	// Effects
+	// ====================================================================
+
+	// Restore focus when LogViewer closes to ensure global hotkeys work
+	useEffect(() => {
+		if (!logViewerOpen) {
+			setTimeout(() => {
+				if (inputRef.current) {
+					inputRef.current.focus();
+				} else if (terminalOutputRef.current) {
+					terminalOutputRef.current.focus();
+				} else {
+					(document.activeElement as HTMLElement)?.blur();
+					document.body.focus();
+				}
+			}, 50);
+		}
+	}, [logViewerOpen, inputRef, terminalOutputRef]);
+
+	// Reset shortcuts search when modal closes
+	useEffect(() => {
+		if (!shortcutsHelpOpen) {
+			getModalActions().setShortcutsSearchQuery('');
+		}
+	}, [shortcutsHelpOpen]);
+
+	// Check for unacknowledged badges on startup (show missed standing ovations)
+	useEffect(() => {
+		if (settingsLoaded && sessionsLoaded) {
+			const { getUnacknowledgedBadgeLevel, autoRunStats } = useSettingsStore.getState();
+			const unacknowledgedLevel = getUnacknowledgedBadgeLevel();
+			if (unacknowledgedLevel !== null) {
+				const badge = CONDUCTOR_BADGES.find((b) => b.level === unacknowledgedLevel);
+				if (badge) {
+					// Show the standing ovation overlay for the missed badge
+					// Small delay to ensure UI is fully rendered
+					setTimeout(() => {
+						getModalActions().setStandingOvationData({
+							badge,
+							isNewRecord: false, // We don't know if it was a record, so default to false
+							recordTimeMs: autoRunStats.longestRunMs,
+						});
+					}, 1000);
+				}
+			}
+		}
+		// autoRunStats.longestRunMs and getUnacknowledgedBadgeLevel intentionally omitted -
+		// this effect runs once on startup to check for missed badges, not on every stats update
+	}, [settingsLoaded, sessionsLoaded]);
+
+	// Check for unacknowledged badges when user returns to the app
+	// Uses multiple triggers: visibility change, window focus, and mouse activity
+	// This catches badges earned during overnight Auto Runs when display was off
+	useEffect(() => {
+		if (!settingsLoaded || !sessionsLoaded) return;
+
+		// Debounce to avoid showing multiple times
+		let checkPending = false;
+
+		const checkForUnacknowledgedBadge = () => {
+			// Don't show if there's already an ovation displayed
+			const currentOvation = useModalStore.getState().getData('standingOvation');
+			if (currentOvation) return;
+			if (checkPending) return;
+
+			const { getUnacknowledgedBadgeLevel, autoRunStats } = useSettingsStore.getState();
+			const unacknowledgedLevel = getUnacknowledgedBadgeLevel();
+			if (unacknowledgedLevel !== null) {
+				const badge = CONDUCTOR_BADGES.find((b) => b.level === unacknowledgedLevel);
+				if (badge) {
+					checkPending = true;
+					// Small delay to let the UI stabilize
+					setTimeout(() => {
+						// Double-check in case it was acknowledged in the meantime
+						if (!useModalStore.getState().getData('standingOvation')) {
+							getModalActions().setStandingOvationData({
+								badge,
+								isNewRecord: false,
+								recordTimeMs: autoRunStats.longestRunMs,
+							});
+						}
+						checkPending = false;
+					}, 500);
+				}
+			}
+		};
+
+		const handleVisibilityChange = () => {
+			// Only check when becoming visible
+			if (!document.hidden) {
+				checkForUnacknowledgedBadge();
+			}
+		};
+
+		const handleWindowFocus = () => {
+			// Window gained focus - user is actively looking at the app
+			checkForUnacknowledgedBadge();
+		};
+
+		// Mouse move handler with heavy debounce - only triggers once per 30 seconds
+		let lastMouseCheck = 0;
+		const handleMouseMove = () => {
+			const now = Date.now();
+			if (now - lastMouseCheck > 30000) {
+				// 30 second debounce
+				lastMouseCheck = now;
+				checkForUnacknowledgedBadge();
+			}
+		};
+
+		document.addEventListener('visibilitychange', handleVisibilityChange);
+		window.addEventListener('focus', handleWindowFocus);
+		document.addEventListener('mousemove', handleMouseMove, { passive: true });
+
+		return () => {
+			document.removeEventListener('visibilitychange', handleVisibilityChange);
+			window.removeEventListener('focus', handleWindowFocus);
+			document.removeEventListener('mousemove', handleMouseMove);
+		};
+	}, [settingsLoaded, sessionsLoaded]);
+
+	// Check for unacknowledged keyboard mastery levels on startup
+	useEffect(() => {
+		if (settingsLoaded && sessionsLoaded) {
+			const unacknowledgedLevel = useSettingsStore
+				.getState()
+				.getUnacknowledgedKeyboardMasteryLevel();
+			if (unacknowledgedLevel !== null) {
+				// Show the keyboard mastery level-up celebration after a short delay
+				setTimeout(() => {
+					getModalActions().setPendingKeyboardMasteryLevel(unacknowledgedLevel);
+				}, 1200); // Slightly longer delay than badge to avoid overlap
+			}
+		}
+		// getUnacknowledgedKeyboardMasteryLevel intentionally omitted -
+		// this effect runs once on startup to check for unacknowledged levels, not on function changes
+	}, [settingsLoaded, sessionsLoaded]);
+
+	// ====================================================================
+	// Active session (narrow) - Git Diff / Director's Notes / jump-to-failing
+	// ====================================================================
+	// PERF: Never useSessionStore(selectActiveSession). Streamed logs/tokens
+	// would wake App via this hook. Handlers resolve via getState(); jump-to-
+	// failing only needs primitive focus fields. Use the resolved agent id
+	// (same fallback as selectActiveSession) with those fields.
+	const activeSessionId = useSessionStore((s) => selectActiveSession(s)?.id);
+	const activeTabId = useSessionStore((s) => selectActiveSession(s)?.activeTabId);
+	const activeInputMode = useSessionStore((s) => selectActiveSession(s)?.inputMode);
+
+	// ====================================================================
+	// Agent Error: Jump to Failing Tab
+	// ====================================================================
+
+	// Only offer "Jump to failing tab" for live errors (not historical, since
+	// the user already navigated to view the historical entry) and only when
+	// the user isn't already focused on the failing tab. The failing tab id
+	// is recorded on the session as `agentErrorTabId`.
+	const failingTabId = !isHistorical ? errorSession?.agentErrorTabId : undefined;
+	const isAlreadyOnFailingTab =
+		errorSession != null &&
+		failingTabId != null &&
+		activeSessionId === errorSession.id &&
+		activeTabId === failingTabId &&
+		activeInputMode === 'ai';
+
+	const handleJumpToFailingAgent = useMemo(() => {
+		if (!errorSession || !failingTabId || isAlreadyOnFailingTab) return undefined;
+		return () => {
+			useSessionStore.getState().setActiveSessionId(errorSession.id);
+			updateSessionWith(errorSession.id, (s) => ({
+				...s,
+				...aiTabFocusFields(
+					s.aiTabs?.some((t) => t.id === failingTabId) ? failingTabId : undefined
+				),
+			}));
+		};
+	}, [errorSession, failingTabId, isAlreadyOnFailingTab]);
+
+	// ====================================================================
+	// Git Diff Opener (Tier 3C)
+	// ====================================================================
+
+	const { refreshGitStatus } = useGitDetail();
+
+	const handleViewGitDiff = useCallback(async () => {
+		const activeSession = selectActiveSession(useSessionStore.getState());
+		if (!activeSession || !activeSession.isGitRepo) return;
+
+		const cwd =
+			activeSession.inputMode === 'terminal'
+				? activeSession.shellCwd || activeSession.cwd
+				: activeSession.cwd;
+		const sshRemoteId =
+			activeSession.sshRemoteId ||
+			(activeSession.sessionSshRemoteConfig?.enabled
+				? activeSession.sessionSshRemoteConfig.remoteId
+				: undefined) ||
+			undefined;
+		const diff = await gitService.getDiff(cwd, undefined, sshRemoteId);
+
+		if (diff.diff) {
+			getModalActions().setGitDiffPreview(diff.diff);
+		} else {
+			notifyCenterFlash({ message: 'No diff to examine', color: 'theme' });
+			// Polling cache said there were changes but `git diff` is empty -
+			// repo state changed since the last poll. Re-sync so the widget
+			// stops advertising stale stats.
+			void refreshGitStatus();
+		}
+	}, [refreshGitStatus]);
+
+	// ====================================================================
+	// Director's Notes Session Navigation (Tier 3C)
+	// ====================================================================
+
+	// `sessionName` rides along because the deferred branch resumes on a LATER
+	// tick, by which point the entry that carried the name is gone.
+	const pendingResumeRef = useRef<{
+		agentSessionId: string;
+		targetSessionId: string;
+		sessionName?: string;
+	} | null>(null);
+
+	const handleDirectorNotesResumeSession = useCallback(
+		(sourceSessionId: string, agentSessionId: string, sessionName?: string) => {
+			// Close the Director's Notes modal
+			getModalActions().setDirectorNotesOpen(false);
+
+			// A group chat outranks the agent view in the main window, so landing
+			// on the right agent is not enough - without this the jump appears to
+			// do nothing because the room is still what's rendered. Also covers the
+			// early-return below, where activeSessionId already points at the target.
+			useGroupChatStore.getState().setActiveGroupChatId(null);
+
+			// If already on the right agent, resume directly
+			if (useSessionStore.getState().activeSessionId === sourceSessionId) {
+				handleResumeSessionRef?.current?.(agentSessionId, undefined, sessionName);
+				return;
+			}
+
+			// Switch to the target agent and defer resume until activeSessionId updates
+			pendingResumeRef.current = { agentSessionId, targetSessionId: sourceSessionId, sessionName };
+			useSessionStore.getState().setActiveSessionId(sourceSessionId);
+		},
+		[handleResumeSessionRef]
+	);
+
+	// Effect: process pending resume after agent switch completes
+	useEffect(() => {
+		if (pendingResumeRef.current && activeSessionId === pendingResumeRef.current.targetSessionId) {
+			const { agentSessionId, sessionName } = pendingResumeRef.current;
+			pendingResumeRef.current = null;
+			handleResumeSessionRef?.current?.(agentSessionId, undefined, sessionName);
+		}
+	}, [activeSessionId, handleResumeSessionRef]);
+
+	// ====================================================================
+	// Return
+	// ====================================================================
+
+	return {
+		// Derived state
+		errorSession,
+		effectiveAgentError: effectiveError ?? null,
+		recoveryActions,
+		handleJumpToFailingAgent,
+
+		// Simple close handlers
+		handleCloseGitDiff,
+		handleCloseGitLog,
+		handleCloseSettings,
+		handleCloseDebugPackage,
+		handleCloseShortcutsHelp,
+		handleCloseAboutModal,
+		handleCloseFeedbackModal,
+		handleCloseUpdateCheckModal,
+		handleCloseProcessMonitor,
+		handleCloseLogViewer,
+		handleCloseConfirmModal,
+
+		// Session-related close handlers
+		handleCloseDeleteAgentModal,
+		handleCloseNewInstanceModal,
+		handleCloseEditAgentModal,
+		handleCloseRenameSessionModal,
+		handleCloseRenameTabModal,
+
+		// Quit handlers
+		handleConfirmQuit,
+		handleCancelQuit,
+		handleQuitWhenIdle,
+
+		// Celebration handlers
+		onKeyboardMasteryLevelUp,
+		handleKeyboardMasteryCelebrationClose,
+		handleStandingOvationClose,
+		handleFirstRunCelebrationClose,
+
+		// Leaderboard handlers
+		handleOpenLeaderboardRegistration,
+		handleOpenLeaderboardRegistrationFromAbout,
+		handleCloseLeaderboardRegistration,
+		handleSaveLeaderboardRegistration,
+		handleLeaderboardOptOut,
+
+		// Agent error handlers
+		handleCloseAgentErrorModal,
+		handleShowAgentErrorModal,
+		handleClearAgentError,
+		handleStartNewSessionAfterError,
+		handleRetryAfterError,
+		handleRestartAgentAfterError,
+		handleAuthenticateAfterError,
+
+		// Open handlers
+		handleOpenQueueBrowser,
+		handleOpenTabSearch,
+		handleOpenCrossTabSearch,
+		handleOpenPromptComposer,
+		handleOpenFuzzySearch,
+		handleOpenCreatePR,
+		handleOpenAboutModal,
+		handleOpenFeedbackModal,
+		handleOpenBatchRunner,
+		handleOpenMarketplace,
+
+		// Session list openers
+		handleEditAgent,
+		handleOpenCreatePRSession,
+		handleConfigureCue,
+
+		// Tour
+		handleStartTour,
+
+		// Lightbox
+		handleSetLightboxImage,
+		handleCloseLightbox,
+		handleNavigateLightbox,
+		handleDeleteLightboxImage,
+		handleUpdateLightboxImage,
+
+		// Utility close handlers
+		handleCloseAutoRunSetup,
+		handleCloseBatchRunner,
+		handleCloseTabSwitcher,
+		handleCloseCrossTabSearch,
+		handleCloseFileSearch,
+		handleClosePromptComposer,
+		handleCloseCreatePRModal,
+		handleCloseSendToAgent,
+		handleCloseQueueBrowser,
+		handleCloseRenameGroupModal,
+
+		// Quick actions modal openers
+		handleQuickActionsRenameTab,
+		handleQuickActionsOpenTabSwitcher,
+		handleQuickActionsStartTour,
+		handleQuickActionsEditAgent,
+		handleQuickActionsOpenMergeSession,
+		handleQuickActionsOpenSendToAgent,
+		handleQuickActionsOpenCreatePR,
+
+		// LogViewer shortcut handler
+		handleLogViewerShortcutUsed,
+
+		// Git diff opener (Tier 3C)
+		handleViewGitDiff,
+
+		// Director's Notes session navigation (Tier 3C)
+		handleDirectorNotesResumeSession,
+	};
+}

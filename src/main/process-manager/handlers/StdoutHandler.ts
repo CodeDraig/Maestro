@@ -1,0 +1,1042 @@
+// src/main/process-manager/handlers/StdoutHandler.ts
+
+import { EventEmitter } from 'events';
+import { logger } from '../../utils/logger';
+import { stripAllAnsiCodes } from '../../utils/terminalFilter';
+import { appendToBuffer } from '../utils/bufferUtils';
+import { settleProvisionalAgentError } from '../utils/provisionalAgentError';
+import { emitAgentErrorAfterOutput } from '../utils/agentErrorEmit';
+import { aggregateModelUsage, type ModelStats } from '../../parsers/usage-aggregator';
+import { matchSshErrorPattern } from '../../parsers/error-patterns';
+import { FALLBACK_CONTEXT_WINDOW, COMBINED_CONTEXT_AGENTS } from '../../../shared/agentConstants';
+import { formatAgentLoginCommand, getAgentLoginCommand } from '../../../shared/agentMetadata';
+import { getOmpModelContextWindow } from '../../agents/omp-model-catalog';
+import type { ManagedProcess, UsageStats, UsageTotals, AgentError } from '../types';
+import type { DataBufferManager } from './DataBufferManager';
+
+interface StdoutHandlerDependencies {
+	processes: Map<string, ManagedProcess>;
+	emitter: EventEmitter;
+	bufferManager: DataBufferManager;
+}
+
+const MAX_COPILOT_JSON_BUFFER_LENGTH = 1024 * 1024;
+
+/**
+ * Normalize usage stats to handle cumulative vs per-turn usage reporting.
+ *
+ * Claude Code and Codex both report CUMULATIVE session totals rather than per-turn values.
+ * For context window display, we need per-turn values because:
+ * - Anthropic API formula: total_context = input + cacheRead + cacheCreation
+ * - If we use cumulative values, context exceeds 100% after a few turns
+ *
+ * This function detects cumulative reporting (values only increase) and converts to deltas.
+ * On the first usage report, it returns the values as-is.
+ * On subsequent reports, it computes the delta from the previous totals.
+ *
+ * @see https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+ * @see https://codelynx.dev/posts/calculate-claude-code-context
+ */
+function normalizeUsageToDelta(
+	managedProcess: ManagedProcess,
+	usageStats: {
+		inputTokens: number;
+		outputTokens: number;
+		cacheReadInputTokens: number;
+		cacheCreationInputTokens: number;
+		totalCostUsd: number;
+		contextWindow: number;
+		reasoningTokens?: number;
+		absoluteUsage?: UsageStats['absoluteUsage'];
+	}
+): typeof usageStats & { absoluteUsage?: UsageStats['absoluteUsage'] } {
+	const totals: UsageTotals = {
+		inputTokens: usageStats.inputTokens,
+		outputTokens: usageStats.outputTokens,
+		cacheReadInputTokens: usageStats.cacheReadInputTokens,
+		cacheCreationInputTokens: usageStats.cacheCreationInputTokens,
+		reasoningTokens: usageStats.reasoningTokens || 0,
+	};
+
+	const last = managedProcess.lastUsageTotals;
+	const cumulativeFlag = managedProcess.usageIsCumulative;
+
+	if (cumulativeFlag === false) {
+		managedProcess.lastUsageTotals = totals;
+		return usageStats;
+	}
+
+	if (!last) {
+		managedProcess.lastUsageTotals = totals;
+		return usageStats;
+	}
+
+	const delta = {
+		inputTokens: totals.inputTokens - last.inputTokens,
+		outputTokens: totals.outputTokens - last.outputTokens,
+		cacheReadInputTokens: totals.cacheReadInputTokens - last.cacheReadInputTokens,
+		cacheCreationInputTokens: totals.cacheCreationInputTokens - last.cacheCreationInputTokens,
+		reasoningTokens: totals.reasoningTokens - last.reasoningTokens,
+	};
+
+	const isMonotonic =
+		delta.inputTokens >= 0 &&
+		delta.outputTokens >= 0 &&
+		delta.cacheReadInputTokens >= 0 &&
+		delta.cacheCreationInputTokens >= 0 &&
+		delta.reasoningTokens >= 0;
+
+	if (!isMonotonic) {
+		managedProcess.usageIsCumulative = false;
+		managedProcess.lastUsageTotals = totals;
+		return usageStats;
+	}
+
+	managedProcess.usageIsCumulative = true;
+	managedProcess.lastUsageTotals = totals;
+	// Preserve the pre-normalization cumulative totals as `absoluteUsage`, but ONLY
+	// for combined-context providers (Codex) whose cumulative total IS the current
+	// window occupancy. This function also runs for Claude Code, which can look
+	// monotonic for the first turns of a session; Claude's TURN TOTALS here are the
+	// CLI's own sum across the turn's internal API calls (token spend), so attaching
+	// them would let the timeline plot spend as context fill. The first event of a
+	// session returns raw above (no `last` yet) and is already absolute.
+	//
+	// Claude Code still gets an `absoluteUsage`, just not from here: its parser
+	// attaches the LAST internal call's usage, which is a genuine occupancy
+	// snapshot (a single call's input cannot exceed the window) and a different
+	// quantity from the cumulative totals this branch rejects. Every path in this
+	// function preserves an incoming `absoluteUsage` - the three early returns pass
+	// `usageStats` through verbatim, and the spread below re-attaches only for
+	// COMBINED_CONTEXT_AGENTS, which claude-code is not - so it can never be
+	// overwritten or double-attached.
+	const attachesAbsolute = COMBINED_CONTEXT_AGENTS.has(managedProcess.toolType as never);
+	return {
+		...usageStats,
+		inputTokens: delta.inputTokens,
+		outputTokens: delta.outputTokens,
+		cacheReadInputTokens: delta.cacheReadInputTokens,
+		cacheCreationInputTokens: delta.cacheCreationInputTokens,
+		reasoningTokens: delta.reasoningTokens,
+		...(attachesAbsolute
+			? {
+					absoluteUsage: {
+						inputTokens: totals.inputTokens,
+						outputTokens: totals.outputTokens,
+						cacheReadInputTokens: totals.cacheReadInputTokens,
+						cacheCreationInputTokens: totals.cacheCreationInputTokens,
+						reasoningTokens: totals.reasoningTokens,
+					},
+				}
+			: {}),
+	};
+}
+
+/** Split a buffer of concatenated JSON objects (no newline separators) into individual complete objects and a partial remainder. */
+function extractConcatenatedJsonObjects(buffer: string): { messages: string[]; remainder: string } {
+	const messages: string[] = [];
+	let start = -1;
+	let depth = 0;
+	let inString = false;
+	let isEscaped = false;
+
+	for (let i = 0; i < buffer.length; i++) {
+		const char = buffer[i];
+
+		if (start === -1) {
+			if (/\s/.test(char)) {
+				continue;
+			}
+
+			if (char !== '{') {
+				return {
+					messages,
+					remainder: buffer.slice(i),
+				};
+			}
+
+			start = i;
+			depth = 1;
+			inString = false;
+			isEscaped = false;
+			continue;
+		}
+
+		if (inString) {
+			if (isEscaped) {
+				isEscaped = false;
+				continue;
+			}
+
+			if (char === '\\') {
+				isEscaped = true;
+				continue;
+			}
+
+			if (char === '"') {
+				inString = false;
+			}
+			continue;
+		}
+
+		if (char === '"') {
+			inString = true;
+			continue;
+		}
+
+		if (char === '{') {
+			depth++;
+			continue;
+		}
+
+		if (char === '}') {
+			depth--;
+			if (depth === 0) {
+				messages.push(buffer.slice(start, i + 1));
+				start = -1;
+			}
+		}
+	}
+
+	return {
+		messages,
+		remainder: start === -1 ? '' : buffer.slice(start),
+	};
+}
+
+/** Extract the Copilot session ID from a parsed JSON event's top-level or nested data field. */
+function extractCopilotSessionId(parsed: unknown): string | null {
+	if (!parsed || typeof parsed !== 'object') {
+		return null;
+	}
+
+	const raw = parsed as {
+		sessionId?: unknown;
+		data?: {
+			sessionId?: unknown;
+		};
+	};
+
+	if (typeof raw.sessionId === 'string' && raw.sessionId.trim()) {
+		return raw.sessionId;
+	}
+
+	if (typeof raw.data?.sessionId === 'string' && raw.data.sessionId.trim()) {
+		return raw.data.sessionId;
+	}
+
+	return null;
+}
+
+/** Extract the status string from a tool execution state object. */
+function getToolStatus(toolState: unknown): string | null {
+	if (!toolState || typeof toolState !== 'object') {
+		return null;
+	}
+
+	const status = (toolState as { status?: unknown }).status;
+	return typeof status === 'string' ? status : null;
+}
+
+/** Get or lazily initialize the per-process set of emitted tool call IDs for deduplication. */
+function getEmittedToolCallIds(managedProcess: ManagedProcess): Set<string> {
+	if (!managedProcess.emittedToolCallIds) {
+		managedProcess.emittedToolCallIds = new Set<string>();
+	}
+	return managedProcess.emittedToolCallIds;
+}
+
+/** Drop the Copilot JSON remainder buffer if it exceeds the safety limit. Sets the corrupted flag and clears stale tool state. */
+function resetOversizedCopilotJsonBuffer(sessionId: string, managedProcess: ManagedProcess): void {
+	const bufferLength = managedProcess.jsonBuffer?.length || 0;
+	if (bufferLength <= MAX_COPILOT_JSON_BUFFER_LENGTH) {
+		return;
+	}
+
+	logger.warn(
+		'[ProcessManager] Dropping oversized Copilot JSON buffer remainder',
+		'ProcessManager',
+		{
+			sessionId,
+			bufferLength,
+			maxBufferLength: MAX_COPILOT_JSON_BUFFER_LENGTH,
+		}
+	);
+	managedProcess.jsonBuffer = '';
+	// Mark corrupted so subsequent chunks discard until a clean resync point
+	managedProcess.jsonBufferCorrupted = true;
+	managedProcess.emittedToolCallIds?.clear();
+}
+
+/**
+ * Push a corrected context window for a local omp process whose catalog prime
+ * landed AFTER its first usage event was already emitted with the fallback
+ * window.
+ *
+ * Without this the gauge stays at `FALLBACK_CONTEXT_WINDOW` until the next turn
+ * produces a usage event, which on a slow (packaged, cold) prime is the whole
+ * first turn. Called from the spawn handler once the background prime settles.
+ *
+ * No-ops (returning false) when the process has exited, was replaced by a
+ * respawn with a different catalog identity, has nothing pending, or the model
+ * still does not resolve. The pending payload is cleared on a successful push,
+ * so a second call can never emit twice.
+ *
+ * @returns true when a corrected `usage` event was emitted.
+ */
+export function pushResolvedOmpContextWindow(
+	processes: Map<string, ManagedProcess>,
+	emitter: EventEmitter,
+	sessionId: string,
+	catalogKey: string
+): boolean {
+	const managedProcess = processes.get(sessionId);
+	if (!managedProcess || managedProcess.toolType !== 'omp' || managedProcess.sshRemoteId) {
+		return false;
+	}
+	// Guard against a respawn having taken over this sessionId with a different
+	// binary/env identity while the prime was still running.
+	if (managedProcess.ompModelCatalogKey !== catalogKey) {
+		return false;
+	}
+	const pending = managedProcess.pendingOmpUsagePush;
+	if (!pending) {
+		return false;
+	}
+	const resolved = getOmpModelContextWindow(pending.model, catalogKey);
+	if (!resolved || resolved <= 0) {
+		return false;
+	}
+
+	managedProcess.pendingOmpUsagePush = undefined;
+	// Correction-only: the token/cost fields carried in pending.stats were already
+	// counted when the fallback usage event fired for this turn. This correction
+	// re-emits through the ProcessManager EventEmitter, so EVERY on('usage')
+	// consumer sees it - not just the renderer. Zero every token/cost field at the
+	// source so no present or future accumulating consumer can re-add this turn.
+	// Only the context-window fields carry meaning on a correction; the model tag
+	// rides along from pending.stats so same-model window merges still match.
+	emitter.emit('usage', sessionId, {
+		...pending.stats,
+		inputTokens: 0,
+		outputTokens: 0,
+		cacheReadInputTokens: 0,
+		cacheCreationInputTokens: 0,
+		totalCostUsd: 0,
+		reasoningTokens: 0,
+		contextWindow: resolved,
+		contextWindowResolved: true,
+		contextWindowCorrectionOnly: true,
+	});
+	return true;
+}
+
+/**
+ * Handles stdout data processing for child processes.
+ * Extracts session IDs, usage stats, and result data from agent output.
+ */
+export class StdoutHandler {
+	private processes: Map<string, ManagedProcess>;
+	private emitter: EventEmitter;
+	private bufferManager: DataBufferManager;
+
+	constructor(deps: StdoutHandlerDependencies) {
+		this.processes = deps.processes;
+		this.emitter = deps.emitter;
+		this.bufferManager = deps.bufferManager;
+	}
+
+	/**
+	 * Handle stdout data for a session
+	 */
+	handleData(sessionId: string, output: string): void {
+		const managedProcess = this.processes.get(sessionId);
+		if (!managedProcess) return;
+
+		// SSH-launched agent CLIs can leak terminal mode switches like ESC[?1h ESC=
+		// before their real output. Strip non-printing control bytes before parsing.
+		const cleanedOutput = stripAllAnsiCodes(output);
+		if (!cleanedOutput) return;
+
+		const { isStreamJsonMode, isBatchMode } = managedProcess;
+
+		if (isStreamJsonMode) {
+			this.handleStreamJsonData(sessionId, managedProcess, cleanedOutput);
+		} else if (isBatchMode) {
+			managedProcess.jsonBuffer = (managedProcess.jsonBuffer || '') + cleanedOutput;
+		} else {
+			this.bufferManager.emitDataBuffered(sessionId, cleanedOutput);
+		}
+	}
+
+	/** Process stdout data in stream-JSON mode. Handles Copilot concatenated JSON and standard newline-delimited JSON. */
+	private handleStreamJsonData(
+		sessionId: string,
+		managedProcess: ManagedProcess,
+		output: string
+	): void {
+		managedProcess.jsonBuffer = (managedProcess.jsonBuffer || '') + output;
+
+		if (managedProcess.toolType === 'copilot-cli') {
+			// If a previous buffer overflow corrupted state, discard data until
+			// we find a top-level '{' that starts a fresh JSON object.
+			if (managedProcess.jsonBufferCorrupted) {
+				const resyncIndex = managedProcess.jsonBuffer.indexOf('{');
+				if (resyncIndex === -1) {
+					managedProcess.jsonBuffer = '';
+					return;
+				}
+				managedProcess.jsonBuffer = managedProcess.jsonBuffer.slice(resyncIndex);
+				managedProcess.jsonBufferCorrupted = false;
+				managedProcess.emittedToolCallIds?.clear();
+			}
+
+			const firstNonWhitespaceIndex = managedProcess.jsonBuffer.search(/\S/);
+			if (
+				firstNonWhitespaceIndex >= 0 &&
+				managedProcess.jsonBuffer[firstNonWhitespaceIndex] !== '{'
+			) {
+				const firstJsonStart = managedProcess.jsonBuffer.indexOf('{', firstNonWhitespaceIndex);
+				if (firstJsonStart === -1) {
+					const plainText = managedProcess.jsonBuffer.trim();
+					if (plainText) {
+						this.bufferManager.emitDataBuffered(sessionId, plainText);
+					}
+					managedProcess.jsonBuffer = '';
+					return;
+				}
+
+				if (firstJsonStart > firstNonWhitespaceIndex) {
+					const prefix = managedProcess.jsonBuffer.slice(0, firstJsonStart).trim();
+					if (prefix) {
+						this.bufferManager.emitDataBuffered(sessionId, prefix);
+					}
+					managedProcess.jsonBuffer = managedProcess.jsonBuffer.slice(firstJsonStart);
+				}
+			}
+
+			const { messages, remainder } = extractConcatenatedJsonObjects(managedProcess.jsonBuffer);
+			managedProcess.jsonBuffer = remainder;
+			resetOversizedCopilotJsonBuffer(sessionId, managedProcess);
+
+			for (const message of messages) {
+				managedProcess.stdoutBuffer = appendToBuffer(
+					managedProcess.stdoutBuffer || '',
+					message + '\n'
+				);
+				this.processLine(sessionId, managedProcess, message);
+			}
+			return;
+		}
+
+		const lines = managedProcess.jsonBuffer.split('\n');
+		managedProcess.jsonBuffer = lines.pop() || '';
+
+		for (const line of lines) {
+			if (!line.trim()) continue;
+
+			managedProcess.stdoutBuffer = appendToBuffer(managedProcess.stdoutBuffer || '', line + '\n');
+
+			this.processLine(sessionId, managedProcess, line);
+		}
+	}
+
+	/** Parse a single JSON line: detect errors, extract session IDs, and dispatch to the event handler. */
+	private processLine(sessionId: string, managedProcess: ManagedProcess, line: string): void {
+		const { outputParser, toolType } = managedProcess;
+
+		// ── Single JSON parse for the entire line ──
+		// Previously JSON.parse was called up to 3× per line (detectErrorFromLine,
+		// outer parse, parseJsonLine). Now we parse once and pass the object downstream.
+		let parsed: unknown = null;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			// Not valid JSON - handled in the else branch below
+		}
+
+		if (parsed !== null && toolType === 'copilot-cli') {
+			this.emitSessionIdIfNeeded(sessionId, managedProcess, extractCopilotSessionId(parsed));
+		}
+
+		// ── Error detection from parser ──
+		// `interrupted` means the USER pressed Stop, and `interrupt()` sets it
+		// before signalling. Anything a CLI reports after that is a consequence of
+		// the stop, not a failure of the turn: several agents flush a terminal
+		// envelope on their way out (grok emits `stopReason: "cancelled"`, which
+		// the parser correctly classifies as a turn that died early). Raising it
+		// would show a red error and arm recovery for a turn the user deliberately
+		// abandoned, so drop it - the turn is over either way.
+		if (outputParser && !managedProcess.errorEmitted && !managedProcess.interrupted) {
+			// Use pre-parsed object when available; fall back to line-based detection
+			// for non-JSON lines (e.g., Claude embedded JSON in stderr)
+			const agentError =
+				parsed !== null
+					? outputParser.detectErrorFromParsed(parsed)
+					: outputParser.detectErrorFromLine(line);
+			if (agentError) {
+				// Capture the PROVIDER's session id off this line before anything else:
+				// the branch returns without reaching `handleParsedEvent`, so this is the
+				// only chance, and `agentError.sessionId` below is Maestro's own
+				// composite id, not the agent's. A failing terminal envelope is exactly
+				// where an id can arrive for the first and last time - grok reports one
+				// only on `end`, and an `end` that died early now leaves through here.
+				// Losing it means recovery from a *recoverable* error silently opens a
+				// fresh conversation and drops the context the retry was supposed to
+				// continue. ExitHandler does the same for the flushed no-newline case.
+				const event = parsed !== null ? outputParser.parseJsonObject(parsed) : null;
+				if (event) {
+					this.emitSessionIdIfNeeded(
+						sessionId,
+						managedProcess,
+						outputParser.extractSessionId(event)
+					);
+				}
+				agentError.sessionId = sessionId;
+				// Tag the error with the remote UUID so downstream listeners
+				// (capabilitySnapshots.markAuthRequired) can flip the
+				// per-remote pill rather than the local one. Undefined for
+				// local-spawn sessions, which keeps prior behavior.
+				if (managedProcess.sshRemoteId) {
+					agentError.sshRemoteId = managedProcess.sshRemoteId;
+				}
+
+				if (agentError.type === 'auth_expired' && managedProcess.sshRemoteHost) {
+					// Choose the login command by agentId - error-pattern messages
+					// are often generic (no CLI name) and first-match-wins ordering
+					// can shadow the ones that do name a command. A small map keeps
+					// every agent correct without depending on pattern text/order.
+					const login = getAgentLoginCommand(toolType, undefined, { remote: true });
+					// Some agents have no login subcommand and only expose the flow
+					// as a slash command inside their TUI, so name that follow-up
+					// rather than implying the one-liner finishes the job.
+					const followUp = login?.followUp ? ` then type "${login.followUp}"` : '';
+					agentError.message = login
+						? `Authentication failed on remote host "${managedProcess.sshRemoteHost}". SSH into the remote and run "${formatAgentLoginCommand(login)}"${followUp} to re-authenticate.`
+						: `Authentication failed on remote host "${managedProcess.sshRemoteHost}". SSH into the remote to re-authenticate.`;
+				}
+
+				// A notice the CLI may retry past does not end the turn. Hold it, and let
+				// the lines that follow decide (see resolveProvisionalError).
+				if (parsed !== null && outputParser.isProvisionalErrorNotice?.(parsed)) {
+					managedProcess.provisionalError = agentError;
+					logger.info('[ProcessManager] Holding in-turn API error notice', 'ProcessManager', {
+						sessionId,
+						errorType: agentError.type,
+						errorMessage: agentError.message,
+					});
+					return;
+				}
+
+				managedProcess.provisionalError = undefined;
+				// A failed terminal envelope (maestro-p's `timeout`, a `claude -p`
+				// error result) ends the turn, so what the agent said before it is
+				// the turn's last output and goes out ahead of the error.
+				emitAgentErrorAfterOutput(
+					this.emitter,
+					this.bufferManager,
+					sessionId,
+					managedProcess,
+					agentError,
+					{ flushStreamedText: !!event && outputParser.isResultMessage(event) }
+				);
+				return;
+			}
+		}
+
+		// ── SSH error detection (line-based - SSH patterns are plain text) ──
+		// Only check non-JSON lines. Valid JSON lines contain structured agent output
+		// (e.g., assistant messages) whose text content can false-positive match SSH
+		// error patterns like "command not found" when the agent quotes shell commands.
+		// `!interrupted` for the same reason as the parser branch above: a stopped
+		// turn must not surface as a crash. Whatever a torn-down remote writes on
+		// its way out, raising it here would arm recovery for a turn the user
+		// deliberately abandoned.
+		if (
+			!managedProcess.errorEmitted &&
+			!managedProcess.interrupted &&
+			managedProcess.sshRemoteId &&
+			parsed === null
+		) {
+			const sshError = matchSshErrorPattern(line);
+			if (sshError) {
+				const agentError: AgentError = {
+					type: sshError.type,
+					message: sshError.message,
+					recoverable: sshError.recoverable,
+					agentId: toolType,
+					sessionId,
+					sshRemoteId: managedProcess.sshRemoteId,
+					timestamp: Date.now(),
+					raw: { errorLine: line },
+				};
+				emitAgentErrorAfterOutput(
+					this.emitter,
+					this.bufferManager,
+					sessionId,
+					managedProcess,
+					agentError
+				);
+				return;
+			}
+		}
+
+		// ── Held in-turn error notice ──
+		// Not after a Stop: a result the CLI flushes on its way out would otherwise
+		// raise the held notice for a turn the user abandoned. Exit drops it.
+		const settleHeldErrorAfterResult =
+			!!managedProcess.provisionalError &&
+			!managedProcess.interrupted &&
+			parsed !== null &&
+			!!outputParser &&
+			this.resolveProvisionalError(sessionId, managedProcess, parsed, outputParser);
+
+		// ── Process parsed data ──
+		if (parsed !== null) {
+			if (outputParser) {
+				this.handleParsedEvent(sessionId, managedProcess, parsed, outputParser);
+				// After the result, not before it: the renderer reads output that
+				// arrives after an error as recovery and erases the error card.
+				if (settleHeldErrorAfterResult) {
+					settleProvisionalAgentError(this.emitter, this.bufferManager, sessionId, managedProcess);
+				}
+			} else {
+				this.handleLegacyMessage(sessionId, managedProcess, parsed);
+			}
+		} else if (!outputParser) {
+			// Only emit raw non-JSON lines when there's no output parser.
+			// JSONL agents (copilot-cli, codex, opencode, factory-droid) may output
+			// non-JSON noise from shell profiles or MCP server startup that should
+			// not be displayed to the user.
+			this.bufferManager.emitDataBuffered(sessionId, line);
+		}
+		// Non-JSON lines from JSONL agents are silently suppressed (shell profile noise, MCP startup, etc.)
+	}
+
+	/**
+	 * Decide a held in-turn error notice from the line that followed it.
+	 *
+	 * - A result message: the turn ended on the failure. Returns true, and the
+	 *   caller emits the notice right after the result's own output, so the
+	 *   result cannot read as recovery and erase it.
+	 * - Model output (text or a tool call): the CLI recovered and the turn goes on.
+	 *   Drop the notice. Raising it was what put a working tab into the blocking
+	 *   error state and queued the user's next message behind a live process.
+	 * - Anything else (system, usage, init) says nothing yet. Keep holding; exit
+	 *   emits whatever is still held.
+	 */
+	private resolveProvisionalError(
+		sessionId: string,
+		managedProcess: ManagedProcess,
+		parsed: unknown,
+		outputParser: NonNullable<ManagedProcess['outputParser']>
+	): boolean {
+		const event = outputParser.parseJsonObject(parsed);
+		if (!event) return false;
+
+		if (outputParser.isResultMessage(event)) {
+			return true;
+		}
+
+		if (event.type === 'text' || event.type === 'tool_use') {
+			logger.info(
+				'[ProcessManager] Agent continued past in-turn API error notice; dropping it',
+				'ProcessManager',
+				{ sessionId, errorMessage: managedProcess.provisionalError?.message }
+			);
+			managedProcess.provisionalError = undefined;
+		}
+		return false;
+	}
+
+	/** Handle a parsed JSON event: extract usage, session IDs, tool executions, and result data. */
+	private handleParsedEvent(
+		sessionId: string,
+		managedProcess: ManagedProcess,
+		parsed: unknown,
+		outputParser: NonNullable<ManagedProcess['outputParser']>
+	): void {
+		const event = outputParser.parseJsonObject(parsed);
+
+		if (!event) return;
+
+		// OpenCode emits multiple steps: step_start → text → tool_use → step_finish(tool-calls) → repeat
+		// Each step may have a text event. Only the final text (before reason:"stop") is the real result.
+		// Reset resultEmitted on each new step so the last text event wins instead of the first.
+		if (event.type === 'init' && managedProcess.toolType === 'opencode') {
+			managedProcess.resultEmitted = false;
+			managedProcess.streamedText = '';
+		}
+
+		// Extract usage
+		const usage = outputParser.extractUsage(event);
+		if (usage) {
+			const usageStats = this.buildUsageStats(managedProcess, usage);
+			// Claude Code's modelUsage reports the ACTUAL context used for each API call:
+			// - inputTokens: new input for this turn
+			// - cacheReadInputTokens: conversation history read from cache
+			// - cacheCreationInputTokens: new context being cached
+			// These values directly represent current context window usage.
+			//
+			// Codex reports CUMULATIVE session totals that must be normalized to deltas.
+			//
+			// Terminal has no usage reporting.
+			const normalizedUsageStats =
+				managedProcess.toolType === 'codex' || managedProcess.toolType === 'claude-code'
+					? normalizeUsageToDelta(managedProcess, usageStats)
+					: usageStats;
+
+			this.emitter.emit('usage', sessionId, normalizedUsageStats);
+		}
+
+		// Extract session ID
+		const eventSessionId = outputParser.extractSessionId(event);
+		this.emitSessionIdIfNeeded(sessionId, managedProcess, eventSessionId);
+
+		// Extract slash commands
+		const slashCommands = outputParser.extractSlashCommands(event);
+		if (slashCommands) {
+			this.emitter.emit('slash-commands', sessionId, slashCommands);
+		}
+
+		// Handle streaming text events (OpenCode, Codex reasoning, Grok thought/text)
+		if (event.type === 'text' && event.isPartial && event.text) {
+			// Thinking panel routing:
+			// - Copilot: never thinking-chunk (deltas accumulate in streamedText
+			//   and flush once at exit).
+			// - Grok / Codex / OpenCode: only isReasoning deltas → thinking-chunk.
+			//   These stream the final answer as partial `text` WITHOUT isReasoning;
+			//   dumping those into the thinking panel makes the wizard look finished
+			//   while tools still run (Grok emits no tool events on the stream).
+			// - Claude Code + Factory Droid: forward ALL partials. Claude's assistant
+			//   text arrives as partials with isReasoning undefined; that live preview
+			//   is exactly what drives the thinking display during a turn, and the
+			//   renderer replaces it with the final `result` (useBatchedSessionUpdates
+			//   drops non-sticky thinking/tool logs when assistant stdout arrives,
+			//   cleanupExitedTabLogs on exit). Gating Claude on isReasoning silenced the
+			//   inline thinking display for every ordinary (non-extended-thinking) turn.
+			const toolType = managedProcess.toolType;
+			if (toolType !== 'copilot-cli') {
+				const requiresReasoningTag =
+					toolType === 'grok' || toolType === 'codex' || toolType === 'opencode';
+				if (!requiresReasoningTag || event.isReasoning) {
+					this.emitter.emit('thinking-chunk', sessionId, event.text);
+				}
+			}
+			// Reasoning content is internal thinking - don't include it in the
+			// final response text. Only message content should be in streamedText.
+			if (!event.isReasoning) {
+				managedProcess.streamedText = (managedProcess.streamedText || '') + event.text;
+			}
+		}
+
+		// Handle tool execution events (OpenCode, Codex)
+		if (event.type === 'tool_use' && event.toolName) {
+			const toolStatus = getToolStatus(event.toolState);
+			if (event.toolCallId && toolStatus === 'running') {
+				const emittedToolCallIds = getEmittedToolCallIds(managedProcess);
+				if (emittedToolCallIds.has(event.toolCallId)) {
+					return;
+				}
+				emittedToolCallIds.add(event.toolCallId);
+			} else if (event.toolCallId && (toolStatus === 'completed' || toolStatus === 'failed')) {
+				getEmittedToolCallIds(managedProcess).delete(event.toolCallId);
+			}
+
+			this.emitter.emit('tool-execution', sessionId, {
+				toolName: event.toolName,
+				state: event.toolState,
+				timestamp: Date.now(),
+				toolCallId: event.toolCallId,
+				parentToolUseId: event.parentToolUseId,
+			});
+		}
+
+		// Handle extra parallel tool results carried alongside a primary tool_use
+		// event (Claude Code bundles parallel tool_result blocks into one message).
+		// The primary result is emitted by the tool_use path above; these are the
+		// rest, each finalizing its own call so no parallel badge stays 'running'.
+		if (event.toolResultBlocks?.length) {
+			for (const result of event.toolResultBlocks) {
+				const status = getToolStatus(result.toolState);
+				if (
+					result.toolCallId &&
+					(status === 'completed' || status === 'failed' || status === 'error')
+				) {
+					getEmittedToolCallIds(managedProcess).delete(result.toolCallId);
+				}
+				this.emitter.emit('tool-execution', sessionId, {
+					toolName: result.toolName,
+					state: result.toolState,
+					timestamp: Date.now(),
+					toolCallId: result.toolCallId,
+					parentToolUseId: result.parentToolUseId,
+				});
+			}
+		}
+
+		// Handle tool_use blocks embedded in text events (Claude Code mixed content)
+		if (event.toolUseBlocks?.length) {
+			for (const tool of event.toolUseBlocks) {
+				if (tool.id) {
+					const emittedToolCallIds = getEmittedToolCallIds(managedProcess);
+					if (emittedToolCallIds.has(tool.id)) {
+						continue;
+					}
+					emittedToolCallIds.add(tool.id);
+				}
+
+				this.emitter.emit('tool-execution', sessionId, {
+					toolName: tool.name,
+					state: { status: 'running', input: tool.input },
+					timestamp: Date.now(),
+					toolCallId: tool.id,
+					parentToolUseId: event.parentToolUseId,
+				});
+			}
+		}
+
+		// Codex can emit multiple agent_message results in a single turn:
+		// an interim "I'm checking..." message and then the final answer.
+		// Keep the latest result text and emit once at turn completion.
+		if (managedProcess.toolType === 'codex' && outputParser.isResultMessage(event) && event.text) {
+			managedProcess.streamedText = event.text;
+		}
+
+		// For Codex, flush the latest captured result when the turn completes.
+		// turn.completed is normalized as a usage event by the Codex parser.
+		if (
+			managedProcess.toolType === 'codex' &&
+			event.type === 'usage' &&
+			!managedProcess.resultEmitted
+		) {
+			const resultText = managedProcess.streamedText || '';
+			if (resultText) {
+				managedProcess.resultEmitted = true;
+				this.bufferManager.emitDataBuffered(sessionId, resultText);
+			}
+		}
+
+		// Copilot CLI: capture content-bearing no-phase `assistant.message`
+		// events as `streamedText` but never flush in-flight. Copilot's stdout
+		// signaling is unreliable for "session done":
+		//   - assistant.turn_end fires after every LLM turn, including
+		//     narration turns ("I'll delegate this to..."), so it can't
+		//     mark session end.
+		//   - session.shutdown is NOT written to stdout in batch mode -
+		//     it only goes to `~/.copilot/session-state/<id>/events.jsonl`,
+		//     and Copilot may keep writing to that file (via subagent
+		//     processes) AFTER our parent process exits.
+		// The authoritative completion signal lives on disk, so we defer
+		// the final flush to ExitHandler - which awaits the disk-side
+		// shutdown marker before emitting the `exit` event. Legacy
+		// `phase: 'final_answer'` messages still flush immediately via
+		// the path below.
+		if (
+			managedProcess.toolType === 'copilot-cli' &&
+			outputParser.isResultMessage(event) &&
+			event.text
+		) {
+			const raw = event.raw as { type?: string; data?: { phase?: string } } | undefined;
+			if (raw?.type === 'assistant.message' && raw.data?.phase === undefined) {
+				managedProcess.streamedText = event.text;
+			}
+		}
+
+		// Skip processing error events further - they're handled by agent-error emission
+		if (event.type === 'error') {
+			return;
+		}
+
+		// Handle result
+		const copilotIntermediate =
+			managedProcess.toolType === 'copilot-cli' &&
+			(() => {
+				const raw = event.raw as { type?: string; data?: { phase?: string } } | undefined;
+				return raw?.type === 'assistant.message' && raw.data?.phase === undefined;
+			})();
+
+		if (
+			managedProcess.toolType !== 'codex' &&
+			outputParser.isResultMessage(event) &&
+			!managedProcess.resultEmitted &&
+			!copilotIntermediate
+		) {
+			managedProcess.resultEmitted = true;
+			// For most agents, prefer the result event's text. Fall back to
+			// accumulated streamedText (covers Copilot where the result event
+			// is empty and Factory Droid which never sends an explicit result).
+			const resultText = event.text || managedProcess.streamedText || '';
+
+			// Log synopsis result processing (for debugging empty synopsis issue)
+			if (sessionId.includes('-synopsis-')) {
+				logger.info('[ProcessManager] Synopsis result processing', 'ProcessManager', {
+					sessionId,
+					eventText: event.text?.substring(0, 200) || '(empty)',
+					eventTextLength: event.text?.length || 0,
+					streamedText: managedProcess.streamedText?.substring(0, 200) || '(empty)',
+					streamedTextLength: managedProcess.streamedText?.length || 0,
+					resultTextLength: resultText.length,
+				});
+			}
+
+			if (resultText) {
+				logger.debug('[ProcessManager] Emitting result data via parser', 'ProcessManager', {
+					sessionId,
+					resultLength: resultText.length,
+					hasEventText: !!event.text,
+					hasStreamedText: !!managedProcess.streamedText,
+				});
+				this.bufferManager.emitDataBuffered(sessionId, resultText);
+			} else if (sessionId.includes('-synopsis-')) {
+				logger.warn(
+					'[ProcessManager] Synopsis result is empty - no text to emit',
+					'ProcessManager',
+					{
+						sessionId,
+						rawEvent: JSON.stringify(event).substring(0, 500),
+					}
+				);
+			}
+		}
+	}
+
+	/** Handle legacy (non-parser) JSON messages for Claude Code's native format. */
+	private handleLegacyMessage(
+		sessionId: string,
+		managedProcess: ManagedProcess,
+		msg: unknown
+	): void {
+		const msgRecord = msg as Record<string, unknown>;
+
+		// Skip error messages in fallback mode - they're handled by detectErrorFromLine
+		if (msgRecord.type === 'error' || msgRecord.error) {
+			return;
+		}
+
+		if (msgRecord.type === 'result' && msgRecord.result && !managedProcess.resultEmitted) {
+			managedProcess.resultEmitted = true;
+			logger.debug('[ProcessManager] Emitting result data', 'ProcessManager', {
+				sessionId,
+				resultLength: (msgRecord.result as string).length,
+			});
+			this.bufferManager.emitDataBuffered(sessionId, msgRecord.result as string);
+		}
+
+		if (msgRecord.session_id && !managedProcess.sessionIdEmitted) {
+			managedProcess.sessionIdEmitted = true;
+			this.emitter.emit('session-id', sessionId, msgRecord.session_id as string);
+		}
+
+		if (msgRecord.type === 'system' && msgRecord.subtype === 'init' && msgRecord.slash_commands) {
+			this.emitter.emit('slash-commands', sessionId, msgRecord.slash_commands);
+		}
+
+		if (msgRecord.modelUsage || msgRecord.usage || msgRecord.total_cost_usd !== undefined) {
+			const usageStats = aggregateModelUsage(
+				msgRecord.modelUsage as Record<string, ModelStats> | undefined,
+				(msgRecord.usage as Record<string, unknown>) || {},
+				(msgRecord.total_cost_usd as number) || 0
+			);
+
+			this.emitter.emit('usage', sessionId, usageStats);
+		}
+	}
+
+	/** Build a normalized UsageStats object from parser-extracted token counts. */
+	private buildUsageStats(
+		managedProcess: ManagedProcess,
+		usage: {
+			inputTokens: number;
+			outputTokens: number;
+			cacheReadTokens?: number;
+			cacheCreationTokens?: number;
+			costUsd?: number;
+			contextWindow?: number;
+			contextWindowReported?: boolean;
+			reasoningTokens?: number;
+			model?: string;
+			absoluteUsage?: UsageStats['absoluteUsage'];
+		}
+	): UsageStats {
+		const stats: UsageStats = {
+			inputTokens: usage.inputTokens,
+			outputTokens: usage.outputTokens,
+			cacheReadInputTokens: usage.cacheReadTokens || 0,
+			cacheCreationInputTokens: usage.cacheCreationTokens || 0,
+			totalCostUsd: usage.costUsd || 0,
+			// Occupancy snapshot the parser attached (claude-code's last-call usage).
+			// This object is CONSTRUCTED rather than spread, so anything the parser
+			// adds has to be copied here explicitly or it is silently dropped.
+			absoluteUsage: usage.absoluteUsage,
+			// Prioritize Claude Code's reported contextWindow over spawn config
+			// This ensures we use the actual model's context limit, not a stale config value
+			contextWindow: usage.contextWindow || managedProcess.contextWindow || FALLBACK_CONTEXT_WINDOW,
+			reasoningTokens: usage.reasoningTokens,
+		};
+		// A window is only AUTHORITATIVE when the parser saw it in the provider's
+		// own payload; parsers seed the same field with config values and static
+		// fallbacks, so the flag - not the presence of a number - is the signal.
+		// The renderer ranks a resolved window above the session's stored
+		// customContextWindow, which is usually a materialized creation-time
+		// default rather than a value the user chose (finding P1).
+		if (usage.contextWindowReported && (usage.contextWindow || 0) > 0) {
+			stats.contextWindowResolved = true;
+		}
+		// Oh My Pi's window is model-dependent and reported per turn, so resolve the
+		// per-turn model against the catalog primed for THIS process's binary + env
+		// (ompModelCatalogKey) and let that authoritative value win over the static
+		// per-agent fallback/config (e.g. so opus's 1M isn't masked by the 200k
+		// default). Local runs only; remotes have their own catalog and keep the
+		// configured/fallback window.
+		if (managedProcess.toolType === 'omp' && !managedProcess.sshRemoteId && usage.model) {
+			// Stamp the model this window belongs to so a downstream resolved-window
+			// preservation can't survive a switch to a different omp model.
+			stats.contextWindowModel = usage.model;
+			const resolved = managedProcess.ompModelCatalogKey
+				? getOmpModelContextWindow(usage.model, managedProcess.ompModelCatalogKey)
+				: undefined;
+			if (resolved && resolved > 0) {
+				stats.contextWindow = resolved;
+				stats.contextWindowResolved = true;
+				managedProcess.pendingOmpUsagePush = undefined;
+			} else {
+				// Catalog not primed (or this model missing from it): the stats above
+				// carry the static fallback. Remember them so a prime landing after
+				// the spawn cap can push a corrected window without waiting for the
+				// next turn (see pushResolvedOmpContextWindow).
+				managedProcess.pendingOmpUsagePush = { model: usage.model, stats };
+			}
+		}
+		return stats;
+	}
+
+	/** Emit session-id event at most once per managed process lifecycle. */
+	private emitSessionIdIfNeeded(
+		sessionId: string,
+		managedProcess: ManagedProcess,
+		eventSessionId: string | null | undefined
+	): void {
+		if (!eventSessionId) {
+			return;
+		}
+
+		// Always record the agent-reported session id on the managed process
+		// even after we've emitted the event once. ExitHandler reads this for
+		// Copilot's post-exit events.jsonl wait, and we want to be robust to
+		// the event arriving more than once across a session's lifetime.
+		managedProcess.agentSessionId = eventSessionId;
+
+		if (managedProcess.sessionIdEmitted) {
+			return;
+		}
+
+		managedProcess.sessionIdEmitted = true;
+		logger.debug('[ProcessManager] Emitting session-id event', 'ProcessManager', {
+			sessionId,
+			eventSessionId,
+			toolType: managedProcess.toolType,
+		});
+		this.emitter.emit('session-id', sessionId, eventSessionId);
+	}
+}

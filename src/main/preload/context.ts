@@ -1,0 +1,81 @@
+/**
+ * Preload API for context operations
+ *
+ * Provides the window.maestro.context namespace for:
+ * - Session context transfer and grooming
+ * - Context retrieval from stored sessions
+ */
+
+import { ipcRenderer } from 'electron';
+import type { ClaudeTokenSourceFields } from '../../shared/claudeTokenMode';
+
+/**
+ * Message structure from stored sessions
+ */
+export interface StoredMessage {
+	type: string;
+	role?: string;
+	content: string;
+	timestamp: string;
+	uuid: string;
+	toolUse?: unknown;
+}
+
+/**
+ * Response from getStoredSession
+ */
+export interface StoredSessionResponse {
+	messages: StoredMessage[];
+	total: number;
+	hasMore: boolean;
+}
+
+/**
+ * Creates the context API object for preload exposure
+ */
+export function createContextApi() {
+	return {
+		// Get context from a stored agent session
+		getStoredSession: (
+			agentId: string,
+			projectRoot: string,
+			sessionId: string
+		): Promise<StoredSessionResponse | null> =>
+			ipcRenderer.invoke('context:getStoredSession', agentId, projectRoot, sessionId),
+
+		// Single-call grooming (recommended) - spawns batch process and returns response
+		groomContext: (
+			projectRoot: string,
+			agentType: string,
+			prompt: string,
+			options?: {
+				// SSH remote config for running grooming on a remote host
+				sshRemoteConfig?: {
+					enabled: boolean;
+					remoteId: string | null;
+					workingDirOverride?: string;
+				};
+				// Custom agent configuration
+				customPath?: string;
+				customArgs?: string;
+				customEnvVars?: Record<string, string>;
+				// Run this turn at the bottom of the model/effort ladders.
+				//
+				// Set it for summarization, whose output a human reads once. Do NOT set
+				// it for grooming or transfer: their output BECOMES the context for
+				// every later turn, so a cheap compaction is a defect that compounds
+				// silently. The caller decides because only the caller knows which of
+				// the three it is - the handler just sees a prompt string.
+				cheapTurn?: boolean;
+				// The agent's Claude token source: a TUI agent runs this turn through maestro-p.
+				claudeTokenSource?: ClaudeTokenSourceFields;
+			}
+		): Promise<string> =>
+			ipcRenderer.invoke('context:groomContext', projectRoot, agentType, prompt, options),
+
+		// Cancel all active grooming sessions
+		cancelGrooming: (): Promise<void> => ipcRenderer.invoke('context:cancelGrooming'),
+	};
+}
+
+export type ContextApi = ReturnType<typeof createContextApi>;

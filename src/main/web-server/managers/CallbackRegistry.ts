@@ -1,0 +1,1545 @@
+/**
+ * CallbackRegistry - Manages callback functions for the WebServer
+ *
+ * Centralizes all callback storage and provides typed getter/setter methods.
+ * This separates callback management from the core WebServer logic.
+ */
+
+import type {
+	NotificationInboxRequest,
+	NotificationInboxResult,
+} from '../../../shared/notificationInbox';
+
+import { logger } from '../../utils/logger';
+import type {
+	GetSessionsCallback,
+	GetSessionDetailCallback,
+	WriteToSessionCallback,
+	ExecuteCommandCallback,
+	InterruptSessionCallback,
+	SwitchModeCallback,
+	SelectSessionCallback,
+	SelectTabCallback,
+	NewTabCallback,
+	CloseTabCallback,
+	RenameTabCallback,
+	RenameTabResult,
+	StarTabCallback,
+	SnoozeCommandCallback,
+	AutoRunSteeringCommandCallback,
+	WindowCommandCallback,
+	ReorderTabCallback,
+	ToggleBookmarkCallback,
+	OpenFileTabCallback,
+	OpenFileTabOptions,
+	OpenDocumentGraphCallback,
+	OpenDocumentGraphParams,
+	OpenModalCallback,
+	OpenModalParams,
+	RefreshFileTreeCallback,
+	OpenBrowserTabCallback,
+	OpenBrowserTabOptions,
+	OpenBrowserTabResult,
+	CloseBrowserTabCallback,
+	OpenTerminalTabCallback,
+	OpenTerminalTabConfig,
+	OpenTerminalTabResult,
+	WriteTerminalTabCallback,
+	WriteTerminalTabPayload,
+	WriteTerminalTabResult,
+	ListTerminalTabsCallback,
+	TerminalTabInfo,
+	ReadTerminalTabCallback,
+	ReadTerminalTabPayload,
+	ReadTerminalTabResult,
+	NewAITabWithPromptCallback,
+	ConsultAgentCallback,
+	ConsultAgentParams,
+	ConsultAgentResult,
+	NoteAgentDelegationCallback,
+	EnqueueCommandCallback,
+	EnqueueCommandResult,
+	ListQueueCallback,
+	ListQueueResult,
+	RemoveQueueItemCallback,
+	RemoveQueueItemResult,
+	RefreshAutoRunDocsCallback,
+	ConfigureAutoRunCallback,
+	LaunchGoalRunCallback,
+	SetSessionAutoRunFolderCallback,
+	GetThemeCallback,
+	GetBionifyReadingModeCallback,
+	GetCustomCommandsCallback,
+	GetHistoryCallback,
+	GetAutoRunDocsCallback,
+	GetAutoRunDocContentCallback,
+	SaveAutoRunDocCallback,
+	StopAutoRunCallback,
+	ResetAutoRunDocTasksCallback,
+	ResumeAutoRunErrorCallback,
+	SkipAutoRunDocumentCallback,
+	AbortAutoRunErrorCallback,
+	ListPlaybooksCallback,
+	CreatePlaybookCallback,
+	UpdatePlaybookCallback,
+	DeletePlaybookCallback,
+	WebPlaybook,
+	WebPlaybookDocument,
+	GetSettingsCallback,
+	SetSettingCallback,
+	GetGroupsCallback,
+	CreateGroupCallback,
+	RenameGroupCallback,
+	UpdateGroupCallback,
+	DeleteGroupCallback,
+	MoveSessionToGroupCallback,
+	CreateSessionCallback,
+	CreateWorktreeSessionCallback,
+	CreateSessionConfig,
+	DeleteSessionCallback,
+	RenameSessionCallback,
+	UpdateSessionCwdCallback,
+	UpdateSessionSshCallback,
+	UpdateSessionConfigCallback,
+	WebSettings,
+	SettingValue,
+	GroupData,
+	GetGitStatusCallback,
+	GetGitDiffCallback,
+	GetGitBranchesForSessionCallback,
+	ListWorktreesForSessionCallback,
+	GitStatusResult,
+	GitDiffResult,
+	GitBranchesResult,
+	ListWorktreesResult,
+	GetGroupChatsCallback,
+	StartGroupChatCallback,
+	StartGroupChatOptions,
+	StartGroupChatResult,
+	GetGroupChatStateCallback,
+	StopGroupChatCallback,
+	SendGroupChatMessageCallback,
+	GroupChatState,
+	MergeContextCallback,
+	TransferContextCallback,
+	SummarizeContextCallback,
+	CreateGistCallback,
+	GetCueSubscriptionsCallback,
+	ToggleCueSubscriptionCallback,
+	GetCueActivityCallback,
+	TriggerCueSubscriptionCallback,
+	CueSubscriptionInfo,
+	CueActivityEntry,
+	GetUsageDashboardCallback,
+	GetAchievementsCallback,
+	UsageDashboardData,
+	AchievementData,
+	GenerateDirectorNotesSynopsisCallback,
+	DirectorNotesSynopsisResult,
+	NotifyToastCallback,
+	CadenzaViewCallback,
+	MovementViewCallback,
+	GetMovementStateCallback,
+	GetMovementDesignerInspectionCallback,
+	InteractMovementDesignerCallback,
+	NotifyCenterFlashCallback,
+	GetDebugPackageDepsCallback,
+	NotifyToastParams,
+	NotifyCenterFlashParams,
+	GetMarketplaceManifestCallback,
+	GetMarketplaceDocumentCallback,
+	GetMarketplaceReadmeCallback,
+	ImportMarketplacePlaybookCallback,
+	MarketplaceManifestResult,
+	MarketplaceImportResult,
+	ListDesktopSessionsCallback,
+	GetSessionHistoryCallback,
+	GetSessionHistoryOptions,
+	DesktopSessionEntry,
+	SessionHistoryResult,
+} from '../types';
+import type { SnoozeCommandRequest, SnoozeCommandResult } from '../../../shared/snoozeCommands';
+import type {
+	SteeringCommandRequest,
+	SteeringCommandResult,
+} from '../../../shared/autoRunSteeringCommands';
+import type { WindowCommandRequest, WindowCommandResult } from '../../../shared/windowCommands';
+import type { GroupAppearance, GroupUpdateRequest } from '../../../shared/groupAppearance';
+import type { CadenzaPayload } from '../../../shared/cadenza-types';
+import type { MovementPayload, MovementStateSnapshot } from '../../../shared/movement-types';
+
+const LOG_CONTEXT = 'CallbackRegistry';
+
+/**
+ * All callback types supported by the WebServer
+ */
+export interface WebServerCallbacks {
+	getSessions: GetSessionsCallback | null;
+	getSessionDetail: GetSessionDetailCallback | null;
+	getTheme: GetThemeCallback | null;
+	getBionifyReadingMode: GetBionifyReadingModeCallback | null;
+	getCustomCommands: GetCustomCommandsCallback | null;
+	writeToSession: WriteToSessionCallback | null;
+	executeCommand: ExecuteCommandCallback | null;
+	interruptSession: InterruptSessionCallback | null;
+	switchMode: SwitchModeCallback | null;
+	selectSession: SelectSessionCallback | null;
+	selectTab: SelectTabCallback | null;
+	newTab: NewTabCallback | null;
+	closeTab: CloseTabCallback | null;
+	renameTab: RenameTabCallback | null;
+	starTab: StarTabCallback | null;
+	snoozeCommand: SnoozeCommandCallback | null;
+	autoRunSteeringCommand: AutoRunSteeringCommandCallback | null;
+	windowCommand: WindowCommandCallback | null;
+	reorderTab: ReorderTabCallback | null;
+	toggleBookmark: ToggleBookmarkCallback | null;
+	openFileTab: OpenFileTabCallback | null;
+	openDocumentGraph: OpenDocumentGraphCallback | null;
+	openModal: OpenModalCallback | null;
+	notificationInbox:
+		| ((request: NotificationInboxRequest) => Promise<NotificationInboxResult>)
+		| null;
+	refreshFileTree: RefreshFileTreeCallback | null;
+	openBrowserTab: OpenBrowserTabCallback | null;
+	closeBrowserTab: CloseBrowserTabCallback | null;
+	openTerminalTab: OpenTerminalTabCallback | null;
+	writeTerminalTab: WriteTerminalTabCallback | null;
+	listTerminalTabs: ListTerminalTabsCallback | null;
+	readTerminalTab: ReadTerminalTabCallback | null;
+	newAITabWithPrompt: NewAITabWithPromptCallback | null;
+	consultAgent: ConsultAgentCallback | null;
+	noteAgentDelegation: NoteAgentDelegationCallback | null;
+	enqueueCommand: EnqueueCommandCallback | null;
+	listQueue: ListQueueCallback | null;
+	removeQueueItem: RemoveQueueItemCallback | null;
+	refreshAutoRunDocs: RefreshAutoRunDocsCallback | null;
+	configureAutoRun: ConfigureAutoRunCallback | null;
+	launchGoalRun: LaunchGoalRunCallback | null;
+	setSessionAutoRunFolder: SetSessionAutoRunFolderCallback | null;
+	getHistory: GetHistoryCallback | null;
+	getAutoRunDocs: GetAutoRunDocsCallback | null;
+	getAutoRunDocContent: GetAutoRunDocContentCallback | null;
+	saveAutoRunDoc: SaveAutoRunDocCallback | null;
+	stopAutoRun: StopAutoRunCallback | null;
+	resetAutoRunDocTasks: ResetAutoRunDocTasksCallback | null;
+	resumeAutoRunError: ResumeAutoRunErrorCallback | null;
+	skipAutoRunDocument: SkipAutoRunDocumentCallback | null;
+	abortAutoRunError: AbortAutoRunErrorCallback | null;
+	listPlaybooks: ListPlaybooksCallback | null;
+	createPlaybook: CreatePlaybookCallback | null;
+	updatePlaybook: UpdatePlaybookCallback | null;
+	deletePlaybook: DeletePlaybookCallback | null;
+	getSettings: GetSettingsCallback | null;
+	setSetting: SetSettingCallback | null;
+	getGroups: GetGroupsCallback | null;
+	createGroup: CreateGroupCallback | null;
+	renameGroup: RenameGroupCallback | null;
+	updateGroup: UpdateGroupCallback | null;
+	deleteGroup: DeleteGroupCallback | null;
+	moveSessionToGroup: MoveSessionToGroupCallback | null;
+	createSession: CreateSessionCallback | null;
+	createWorktreeSession: CreateWorktreeSessionCallback | null;
+	deleteSession: DeleteSessionCallback | null;
+	renameSession: RenameSessionCallback | null;
+	updateSessionCwd: UpdateSessionCwdCallback | null;
+	updateSessionSsh: UpdateSessionSshCallback | null;
+	updateSessionConfig: UpdateSessionConfigCallback | null;
+	getGitStatus: GetGitStatusCallback | null;
+	getGitDiff: GetGitDiffCallback | null;
+	getGitBranchesForSession: GetGitBranchesForSessionCallback | null;
+	listWorktreesForSession: ListWorktreesForSessionCallback | null;
+	getGroupChats: GetGroupChatsCallback | null;
+	startGroupChat: StartGroupChatCallback | null;
+	getGroupChatState: GetGroupChatStateCallback | null;
+	stopGroupChat: StopGroupChatCallback | null;
+	sendGroupChatMessage: SendGroupChatMessageCallback | null;
+	mergeContext: MergeContextCallback | null;
+	transferContext: TransferContextCallback | null;
+	summarizeContext: SummarizeContextCallback | null;
+	createGist: CreateGistCallback | null;
+	getCueSubscriptions: GetCueSubscriptionsCallback | null;
+	toggleCueSubscription: ToggleCueSubscriptionCallback | null;
+	getCueActivity: GetCueActivityCallback | null;
+	triggerCueSubscription: TriggerCueSubscriptionCallback | null;
+	getUsageDashboard: GetUsageDashboardCallback | null;
+	getAchievements: GetAchievementsCallback | null;
+	generateDirectorNotesSynopsis: GenerateDirectorNotesSynopsisCallback | null;
+	notifyToast: NotifyToastCallback | null;
+	cadenzaView: CadenzaViewCallback | null;
+	movementView: MovementViewCallback | null;
+	getMovementState: GetMovementStateCallback | null;
+	getMovementDesignerInspection: GetMovementDesignerInspectionCallback | null;
+	interactMovementDesigner: InteractMovementDesignerCallback | null;
+	notifyCenterFlash: NotifyCenterFlashCallback | null;
+	getDebugPackageDeps: GetDebugPackageDepsCallback | null;
+	getMarketplaceManifest: GetMarketplaceManifestCallback | null;
+	getMarketplaceDocument: GetMarketplaceDocumentCallback | null;
+	getMarketplaceReadme: GetMarketplaceReadmeCallback | null;
+	importMarketplacePlaybook: ImportMarketplacePlaybookCallback | null;
+	listDesktopSessions: ListDesktopSessionsCallback | null;
+	getSessionHistory: GetSessionHistoryCallback | null;
+}
+
+export class CallbackRegistry {
+	private callbacks: WebServerCallbacks = {
+		getSessions: null,
+		getSessionDetail: null,
+		getTheme: null,
+		getBionifyReadingMode: null,
+		getCustomCommands: null,
+		writeToSession: null,
+		executeCommand: null,
+		interruptSession: null,
+		switchMode: null,
+		selectSession: null,
+		selectTab: null,
+		newTab: null,
+		closeTab: null,
+		renameTab: null,
+		starTab: null,
+		snoozeCommand: null,
+		autoRunSteeringCommand: null,
+		windowCommand: null,
+		reorderTab: null,
+		toggleBookmark: null,
+		openFileTab: null,
+		openDocumentGraph: null,
+		openModal: null,
+		notificationInbox: null,
+		refreshFileTree: null,
+		openBrowserTab: null,
+		closeBrowserTab: null,
+		openTerminalTab: null,
+		writeTerminalTab: null,
+		listTerminalTabs: null,
+		readTerminalTab: null,
+		newAITabWithPrompt: null,
+		consultAgent: null,
+		noteAgentDelegation: null,
+		enqueueCommand: null,
+		listQueue: null,
+		removeQueueItem: null,
+		refreshAutoRunDocs: null,
+		configureAutoRun: null,
+		launchGoalRun: null,
+		setSessionAutoRunFolder: null,
+		getHistory: null,
+		getAutoRunDocs: null,
+		getAutoRunDocContent: null,
+		saveAutoRunDoc: null,
+		stopAutoRun: null,
+		resetAutoRunDocTasks: null,
+		resumeAutoRunError: null,
+		skipAutoRunDocument: null,
+		abortAutoRunError: null,
+		listPlaybooks: null,
+		createPlaybook: null,
+		updatePlaybook: null,
+		deletePlaybook: null,
+		getSettings: null,
+		setSetting: null,
+		getGroups: null,
+		createGroup: null,
+		renameGroup: null,
+		updateGroup: null,
+		deleteGroup: null,
+		moveSessionToGroup: null,
+		createSession: null,
+		createWorktreeSession: null,
+		deleteSession: null,
+		renameSession: null,
+		updateSessionCwd: null,
+		updateSessionSsh: null,
+		updateSessionConfig: null,
+		getGitStatus: null,
+		getGitDiff: null,
+		getGitBranchesForSession: null,
+		listWorktreesForSession: null,
+		getGroupChats: null,
+		startGroupChat: null,
+		getGroupChatState: null,
+		stopGroupChat: null,
+		sendGroupChatMessage: null,
+		mergeContext: null,
+		transferContext: null,
+		summarizeContext: null,
+		createGist: null,
+		getCueSubscriptions: null,
+		toggleCueSubscription: null,
+		getCueActivity: null,
+		triggerCueSubscription: null,
+		getUsageDashboard: null,
+		getAchievements: null,
+		generateDirectorNotesSynopsis: null,
+		notifyToast: null,
+		cadenzaView: null,
+		movementView: null,
+		getMovementState: null,
+		getMovementDesignerInspection: null,
+		interactMovementDesigner: null,
+		notifyCenterFlash: null,
+		getDebugPackageDeps: null,
+		getMarketplaceManifest: null,
+		getMarketplaceDocument: null,
+		getMarketplaceReadme: null,
+		importMarketplacePlaybook: null,
+		listDesktopSessions: null,
+		getSessionHistory: null,
+	};
+
+	// ============ Getter Methods ============
+
+	getSessions(): ReturnType<GetSessionsCallback> | [] {
+		return this.callbacks.getSessions?.() ?? [];
+	}
+
+	getSessionDetail(sessionId: string, tabId?: string): ReturnType<GetSessionDetailCallback> | null {
+		return this.callbacks.getSessionDetail?.(sessionId, tabId) ?? null;
+	}
+
+	getTheme(): ReturnType<GetThemeCallback> | null {
+		return this.callbacks.getTheme?.() ?? null;
+	}
+
+	getBionifyReadingMode(): ReturnType<GetBionifyReadingModeCallback> {
+		return this.callbacks.getBionifyReadingMode?.() ?? false;
+	}
+
+	getCustomCommands(): ReturnType<GetCustomCommandsCallback> | [] {
+		return this.callbacks.getCustomCommands?.() ?? [];
+	}
+
+	writeToSession(sessionId: string, data: string): boolean {
+		return this.callbacks.writeToSession?.(sessionId, data) ?? false;
+	}
+
+	async executeCommand(
+		sessionId: string,
+		command: string,
+		inputMode?: 'ai' | 'terminal',
+		tabId?: string,
+		force?: boolean,
+		images?: string[],
+		background?: boolean
+	): Promise<boolean> {
+		if (!this.callbacks.executeCommand) return false;
+		return this.callbacks.executeCommand(
+			sessionId,
+			command,
+			inputMode,
+			tabId,
+			force,
+			images,
+			background
+		);
+	}
+
+	async interruptSession(sessionId: string): Promise<boolean> {
+		return this.callbacks.interruptSession?.(sessionId) ?? false;
+	}
+
+	async switchMode(
+		sessionId: string,
+		mode: 'ai' | 'terminal',
+		background?: boolean
+	): Promise<boolean> {
+		if (!this.callbacks.switchMode) return false;
+		return this.callbacks.switchMode(sessionId, mode, background);
+	}
+
+	async selectSession(sessionId: string, tabId?: string, focus?: boolean): Promise<boolean> {
+		if (!this.callbacks.selectSession) return false;
+		return this.callbacks.selectSession(sessionId, tabId, focus);
+	}
+
+	async selectTab(sessionId: string, tabId: string): Promise<boolean> {
+		if (!this.callbacks.selectTab) return false;
+		return this.callbacks.selectTab(sessionId, tabId);
+	}
+
+	async newTab(sessionId: string, background?: boolean): Promise<{ tabId: string } | null> {
+		if (!this.callbacks.newTab) return null;
+		return this.callbacks.newTab(sessionId, background);
+	}
+
+	async closeTab(sessionId: string, tabId: string): Promise<boolean> {
+		if (!this.callbacks.closeTab) return false;
+		return this.callbacks.closeTab(sessionId, tabId);
+	}
+
+	async renameTab(
+		sessionId: string,
+		tabId: string,
+		newName: string
+	): Promise<boolean | RenameTabResult> {
+		if (!this.callbacks.renameTab) return false;
+		return this.callbacks.renameTab(sessionId, tabId, newName);
+	}
+
+	async starTab(sessionId: string, tabId: string, starred: boolean): Promise<boolean> {
+		if (!this.callbacks.starTab) return false;
+		return this.callbacks.starTab(sessionId, tabId, starred);
+	}
+
+	async snoozeCommand(request: SnoozeCommandRequest): Promise<SnoozeCommandResult> {
+		if (!this.callbacks.snoozeCommand) {
+			return { success: false, error: 'Snooze is not configured' };
+		}
+		return this.callbacks.snoozeCommand(request);
+	}
+
+	async autoRunSteeringCommand(request: SteeringCommandRequest): Promise<SteeringCommandResult> {
+		if (!this.callbacks.autoRunSteeringCommand) {
+			return { success: false, error: 'Auto Run steering is not configured' };
+		}
+		return this.callbacks.autoRunSteeringCommand(request);
+	}
+
+	async windowCommand(request: WindowCommandRequest): Promise<WindowCommandResult> {
+		if (!this.callbacks.windowCommand) {
+			return { success: false, error: 'Window commands are not configured' };
+		}
+		return this.callbacks.windowCommand(request);
+	}
+
+	async reorderTab(sessionId: string, fromIndex: number, toIndex: number): Promise<boolean> {
+		if (!this.callbacks.reorderTab) return false;
+		return this.callbacks.reorderTab(sessionId, fromIndex, toIndex);
+	}
+
+	async toggleBookmark(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.toggleBookmark) return false;
+		return this.callbacks.toggleBookmark(sessionId);
+	}
+
+	async openFileTab(
+		sessionId: string,
+		filePath: string,
+		options: OpenFileTabOptions
+	): Promise<boolean> {
+		if (!this.callbacks.openFileTab) return false;
+		return this.callbacks.openFileTab(sessionId, filePath, options);
+	}
+
+	async openDocumentGraph(params: OpenDocumentGraphParams): Promise<boolean> {
+		if (!this.callbacks.openDocumentGraph) return false;
+		return this.callbacks.openDocumentGraph(params);
+	}
+
+	/** Execute a history operation in the desktop renderer. */
+	async notificationInbox(request: NotificationInboxRequest): Promise<NotificationInboxResult> {
+		return (
+			this.callbacks.notificationInbox?.(request) ?? {
+				success: false,
+				error: 'Notification inbox unavailable',
+			}
+		);
+	}
+	setNotificationInboxCallback(
+		callback: (request: NotificationInboxRequest) => Promise<NotificationInboxResult>
+	): void {
+		this.callbacks.notificationInbox = callback;
+	}
+
+	async openModal(params: OpenModalParams): Promise<boolean> {
+		if (!this.callbacks.openModal) return false;
+		return this.callbacks.openModal(params);
+	}
+
+	async refreshFileTree(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.refreshFileTree) return false;
+		return this.callbacks.refreshFileTree(sessionId);
+	}
+
+	async openBrowserTab(
+		sessionId: string,
+		url: string,
+		options?: OpenBrowserTabOptions
+	): Promise<OpenBrowserTabResult> {
+		if (!this.callbacks.openBrowserTab) return { success: false };
+		return this.callbacks.openBrowserTab(sessionId, url, options);
+	}
+
+	async closeBrowserTab(tabId: string): Promise<boolean> {
+		if (!this.callbacks.closeBrowserTab) return false;
+		return this.callbacks.closeBrowserTab(tabId);
+	}
+
+	async openTerminalTab(
+		sessionId: string,
+		config: OpenTerminalTabConfig,
+		options?: { background?: boolean }
+	): Promise<OpenTerminalTabResult> {
+		if (!this.callbacks.openTerminalTab) return { success: false };
+		return this.callbacks.openTerminalTab(sessionId, config, options);
+	}
+
+	async writeTerminalTab(
+		sessionId: string,
+		payload: WriteTerminalTabPayload
+	): Promise<WriteTerminalTabResult> {
+		if (!this.callbacks.writeTerminalTab) {
+			return { success: false, error: 'Terminal writes not configured' };
+		}
+		return this.callbacks.writeTerminalTab(sessionId, payload);
+	}
+
+	async listTerminalTabs(sessionId?: string): Promise<TerminalTabInfo[]> {
+		if (!this.callbacks.listTerminalTabs) return [];
+		return this.callbacks.listTerminalTabs(sessionId);
+	}
+
+	async readTerminalTab(
+		sessionId: string,
+		payload: ReadTerminalTabPayload
+	): Promise<ReadTerminalTabResult> {
+		if (!this.callbacks.readTerminalTab) {
+			return { success: false, error: 'Terminal reads not configured' };
+		}
+		return this.callbacks.readTerminalTab(sessionId, payload);
+	}
+
+	async newAITabWithPrompt(
+		sessionId: string,
+		prompt: string,
+		background?: boolean
+	): Promise<{ success: boolean; tabId?: string }> {
+		if (!this.callbacks.newAITabWithPrompt) return { success: false };
+		return this.callbacks.newAITabWithPrompt(sessionId, prompt, background);
+	}
+
+	async consultAgent(params: ConsultAgentParams): Promise<ConsultAgentResult> {
+		if (!this.callbacks.consultAgent) {
+			return { success: false, error: 'Cross-agent consults are not configured' };
+		}
+		return this.callbacks.consultAgent(params);
+	}
+
+	noteAgentDelegation(notice: Parameters<NoteAgentDelegationCallback>[0]): void {
+		if (!this.callbacks.noteAgentDelegation) return;
+		this.callbacks.noteAgentDelegation(notice);
+	}
+
+	async enqueueCommand(
+		sessionId: string,
+		command: string,
+		inputMode?: 'ai' | 'terminal',
+		tabId?: string,
+		images?: string[],
+		background?: boolean
+	): Promise<EnqueueCommandResult> {
+		if (!this.callbacks.enqueueCommand) return { success: false, error: 'not configured' };
+		return this.callbacks.enqueueCommand(sessionId, command, inputMode, tabId, images, background);
+	}
+
+	async listQueue(sessionId?: string): Promise<ListQueueResult> {
+		if (!this.callbacks.listQueue) return { success: false, queues: [], error: 'not configured' };
+		return this.callbacks.listQueue(sessionId);
+	}
+
+	async removeQueueItem(sessionId: string, itemId: string): Promise<RemoveQueueItemResult> {
+		if (!this.callbacks.removeQueueItem)
+			return { success: false, removed: false, error: 'not configured' };
+		return this.callbacks.removeQueueItem(sessionId, itemId);
+	}
+
+	async refreshAutoRunDocs(sessionId: string, background?: boolean): Promise<boolean> {
+		if (!this.callbacks.refreshAutoRunDocs) return false;
+		return this.callbacks.refreshAutoRunDocs(sessionId, background);
+	}
+
+	async configureAutoRun(
+		sessionId: string,
+		config: {
+			documents: Array<{ filename: string; resetOnCompletion?: boolean }>;
+			prompt?: string;
+			loopEnabled?: boolean;
+			maxLoops?: number;
+			saveAsPlaybook?: string;
+			launch?: boolean;
+			/** Per-run model/effort override - wins over the session model for this run only. */
+			model?: string;
+			effort?: string;
+			/** Skip the documents' MAESTRO:MODEL markers for this run (CLI `--ignore-model-hints`). */
+			ignoreModelHints?: boolean;
+			worktree?: {
+				enabled: boolean;
+				path: string;
+				branchName: string;
+				createPROnCompletion: boolean;
+				prTargetBranch: string;
+			};
+		}
+	): Promise<{ success: boolean; playbookId?: string; error?: string }> {
+		if (!this.callbacks.configureAutoRun) return { success: false, error: 'Not configured' };
+		return this.callbacks.configureAutoRun(sessionId, config);
+	}
+
+	async launchGoalRun(
+		sessionId: string,
+		config: Parameters<LaunchGoalRunCallback>[1]
+	): ReturnType<LaunchGoalRunCallback> {
+		if (!this.callbacks.launchGoalRun) {
+			return { success: false, code: 'NOT_CONFIGURED', error: 'Not configured' };
+		}
+		return this.callbacks.launchGoalRun(sessionId, config);
+	}
+
+	async setSessionAutoRunFolder(
+		sessionId: string,
+		folderPath: string
+	): Promise<{ success: boolean; error?: string }> {
+		if (!this.callbacks.setSessionAutoRunFolder) return { success: false, error: 'Not configured' };
+		return this.callbacks.setSessionAutoRunFolder(sessionId, folderPath);
+	}
+
+	getHistory(projectPath?: string, sessionId?: string): ReturnType<GetHistoryCallback> | [] {
+		return this.callbacks.getHistory?.(projectPath, sessionId) ?? [];
+	}
+
+	async getAutoRunDocs(sessionId: string): Promise<import('../types').AutoRunDocument[]> {
+		if (!this.callbacks.getAutoRunDocs) return [];
+		return this.callbacks.getAutoRunDocs(sessionId);
+	}
+
+	async getAutoRunDocContent(sessionId: string, filename: string): Promise<string> {
+		if (!this.callbacks.getAutoRunDocContent) return '';
+		return this.callbacks.getAutoRunDocContent(sessionId, filename);
+	}
+
+	async saveAutoRunDoc(sessionId: string, filename: string, content: string): Promise<boolean> {
+		if (!this.callbacks.saveAutoRunDoc) return false;
+		return this.callbacks.saveAutoRunDoc(sessionId, filename, content);
+	}
+
+	async stopAutoRun(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.stopAutoRun) return false;
+		return this.callbacks.stopAutoRun(sessionId);
+	}
+
+	async resetAutoRunDocTasks(sessionId: string, filename: string): Promise<boolean> {
+		if (!this.callbacks.resetAutoRunDocTasks) return false;
+		return this.callbacks.resetAutoRunDocTasks(sessionId, filename);
+	}
+
+	async resumeAutoRunError(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.resumeAutoRunError) return false;
+		return this.callbacks.resumeAutoRunError(sessionId);
+	}
+
+	async skipAutoRunDocument(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.skipAutoRunDocument) return false;
+		return this.callbacks.skipAutoRunDocument(sessionId);
+	}
+
+	async abortAutoRunError(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.abortAutoRunError) return false;
+		return this.callbacks.abortAutoRunError(sessionId);
+	}
+
+	async listPlaybooks(sessionId: string): Promise<WebPlaybook[]> {
+		if (!this.callbacks.listPlaybooks) return [];
+		return this.callbacks.listPlaybooks(sessionId);
+	}
+
+	async createPlaybook(
+		sessionId: string,
+		playbook: {
+			name: string;
+			documents: WebPlaybookDocument[];
+			loopEnabled: boolean;
+			maxLoops?: number | null;
+			prompt: string;
+		}
+	): Promise<WebPlaybook | null> {
+		if (!this.callbacks.createPlaybook) return null;
+		return this.callbacks.createPlaybook(sessionId, playbook);
+	}
+
+	async updatePlaybook(
+		sessionId: string,
+		playbookId: string,
+		updates: Partial<{
+			name: string;
+			documents: WebPlaybookDocument[];
+			loopEnabled: boolean;
+			maxLoops?: number | null;
+			prompt: string;
+		}>
+	): Promise<WebPlaybook | null> {
+		if (!this.callbacks.updatePlaybook) return null;
+		return this.callbacks.updatePlaybook(sessionId, playbookId, updates);
+	}
+
+	async deletePlaybook(sessionId: string, playbookId: string): Promise<boolean> {
+		if (!this.callbacks.deletePlaybook) return false;
+		return this.callbacks.deletePlaybook(sessionId, playbookId);
+	}
+
+	getSettings(): WebSettings {
+		if (this.callbacks.getSettings) {
+			return this.callbacks.getSettings();
+		}
+		return {
+			theme: 'dracula',
+			fontSize: 14,
+			enterToSendAI: false,
+			defaultSaveToHistory: true,
+			defaultShowThinking: 'off',
+			autoScroll: true,
+			notificationsEnabled: true,
+			audioFeedbackEnabled: false,
+			colorBlindMode: 'none',
+			conductorProfile: '',
+			maxOutputLines: null,
+			shortcuts: {},
+		};
+	}
+
+	async setSetting(key: string, value: SettingValue): Promise<boolean> {
+		if (!this.callbacks.setSetting) return false;
+		return this.callbacks.setSetting(key, value);
+	}
+
+	getGroups(): GroupData[] {
+		return this.callbacks.getGroups?.() ?? [];
+	}
+
+	async createGroup(
+		name: string,
+		emoji?: string,
+		parentGroupId?: string,
+		appearance?: GroupAppearance
+	): Promise<{ id: string } | null> {
+		if (!this.callbacks.createGroup) return null;
+		return this.callbacks.createGroup(name, emoji, parentGroupId, appearance);
+	}
+
+	async renameGroup(groupId: string, name: string): Promise<boolean> {
+		if (!this.callbacks.renameGroup) return false;
+		return this.callbacks.renameGroup(groupId, name);
+	}
+
+	async updateGroup(groupId: string, update: GroupUpdateRequest): Promise<boolean> {
+		if (!this.callbacks.updateGroup) return false;
+		return this.callbacks.updateGroup(groupId, update);
+	}
+
+	async deleteGroup(groupId: string): Promise<boolean> {
+		if (!this.callbacks.deleteGroup) return false;
+		return this.callbacks.deleteGroup(groupId);
+	}
+
+	async moveSessionToGroup(sessionId: string, groupId: string | null): Promise<boolean> {
+		if (!this.callbacks.moveSessionToGroup) return false;
+		return this.callbacks.moveSessionToGroup(sessionId, groupId);
+	}
+
+	async createSession(
+		name: string,
+		toolType: string,
+		cwd: string,
+		groupId?: string,
+		config?: CreateSessionConfig,
+		background?: boolean
+	): Promise<{ sessionId: string } | null> {
+		if (!this.callbacks.createSession) return null;
+		return this.callbacks.createSession(name, toolType, cwd, groupId, config, background);
+	}
+
+	async createWorktreeSession(
+		parentSessionId: string,
+		config: {
+			branchName: string;
+			baseBranch?: string;
+		},
+		background?: boolean
+	): Promise<{ success: boolean; sessionId?: string; error?: string }> {
+		if (!this.callbacks.createWorktreeSession) return { success: false, error: 'Not configured' };
+		return this.callbacks.createWorktreeSession(parentSessionId, config, background);
+	}
+
+	async deleteSession(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.deleteSession) return false;
+		return this.callbacks.deleteSession(sessionId);
+	}
+
+	async renameSession(sessionId: string, newName: string): Promise<boolean> {
+		if (!this.callbacks.renameSession) return false;
+		return this.callbacks.renameSession(sessionId, newName);
+	}
+
+	async updateSessionCwd(
+		sessionId: string,
+		newCwd: string
+	): Promise<{ success: boolean; error?: string }> {
+		if (!this.callbacks.updateSessionCwd) {
+			return { success: false, error: 'Session cwd updates not configured' };
+		}
+		return this.callbacks.updateSessionCwd(sessionId, newCwd);
+	}
+
+	async updateSessionSsh(
+		sessionId: string,
+		sshPatch: Record<string, unknown>
+	): Promise<{ success: boolean; error?: string }> {
+		if (!this.callbacks.updateSessionSsh) {
+			return { success: false, error: 'Session SSH updates not configured' };
+		}
+		return this.callbacks.updateSessionSsh(sessionId, sshPatch);
+	}
+
+	async updateSessionConfig(
+		sessionId: string,
+		configPatch: Record<string, unknown>
+	): Promise<{ success: boolean; error?: string }> {
+		if (!this.callbacks.updateSessionConfig) {
+			return { success: false, error: 'Session config updates not configured' };
+		}
+		return this.callbacks.updateSessionConfig(sessionId, configPatch);
+	}
+
+	async getGitStatus(sessionId: string): Promise<GitStatusResult> {
+		if (!this.callbacks.getGitStatus) return { branch: '', files: [], ahead: 0, behind: 0 };
+		return this.callbacks.getGitStatus(sessionId);
+	}
+
+	async getGitDiff(sessionId: string, filePath?: string): Promise<GitDiffResult> {
+		if (!this.callbacks.getGitDiff) return { diff: '', files: [] };
+		return this.callbacks.getGitDiff(sessionId, filePath);
+	}
+
+	async getGitBranchesForSession(sessionId: string): Promise<GitBranchesResult> {
+		if (!this.callbacks.getGitBranchesForSession) return { branches: [] };
+		return this.callbacks.getGitBranchesForSession(sessionId);
+	}
+
+	async listWorktreesForSession(sessionId: string): Promise<ListWorktreesResult> {
+		if (!this.callbacks.listWorktreesForSession) return { worktrees: [] };
+		return this.callbacks.listWorktreesForSession(sessionId);
+	}
+
+	async getGroupChats(): Promise<GroupChatState[]> {
+		if (!this.callbacks.getGroupChats) return [];
+		return this.callbacks.getGroupChats();
+	}
+
+	async startGroupChat(
+		topic: string,
+		participantIds: string[],
+		options?: StartGroupChatOptions
+	): Promise<StartGroupChatResult | null> {
+		if (!this.callbacks.startGroupChat) return null;
+		return this.callbacks.startGroupChat(topic, participantIds, options);
+	}
+
+	async getGroupChatState(chatId: string): Promise<GroupChatState | null> {
+		if (!this.callbacks.getGroupChatState) return null;
+		return this.callbacks.getGroupChatState(chatId);
+	}
+
+	async stopGroupChat(chatId: string): Promise<boolean> {
+		if (!this.callbacks.stopGroupChat) return false;
+		return this.callbacks.stopGroupChat(chatId);
+	}
+
+	async sendGroupChatMessage(chatId: string, message: string): Promise<boolean> {
+		if (!this.callbacks.sendGroupChatMessage) return false;
+		return this.callbacks.sendGroupChatMessage(chatId, message);
+	}
+
+	async mergeContext(sourceSessionId: string, targetSessionId: string): Promise<boolean> {
+		if (!this.callbacks.mergeContext) return false;
+		return this.callbacks.mergeContext(sourceSessionId, targetSessionId);
+	}
+
+	async transferContext(sourceSessionId: string, targetSessionId: string): Promise<boolean> {
+		if (!this.callbacks.transferContext) return false;
+		return this.callbacks.transferContext(sourceSessionId, targetSessionId);
+	}
+
+	async summarizeContext(sessionId: string): Promise<boolean> {
+		if (!this.callbacks.summarizeContext) return false;
+		return this.callbacks.summarizeContext(sessionId);
+	}
+
+	async createGist(
+		sessionId: string,
+		description: string,
+		isPublic: boolean,
+		agentSessionId?: string
+	): Promise<{ success: boolean; gistUrl?: string; error?: string }> {
+		if (!this.callbacks.createGist) {
+			return { success: false, error: 'Gist creation not configured' };
+		}
+		return this.callbacks.createGist(sessionId, description, isPublic, agentSessionId);
+	}
+
+	async getCueSubscriptions(sessionId?: string): Promise<CueSubscriptionInfo[]> {
+		if (!this.callbacks.getCueSubscriptions) return [];
+		return this.callbacks.getCueSubscriptions(sessionId);
+	}
+
+	async toggleCueSubscription(subscriptionId: string, enabled: boolean): Promise<boolean> {
+		if (!this.callbacks.toggleCueSubscription) return false;
+		return this.callbacks.toggleCueSubscription(subscriptionId, enabled);
+	}
+
+	async getCueActivity(sessionId?: string, limit?: number): Promise<CueActivityEntry[]> {
+		if (!this.callbacks.getCueActivity) return [];
+		return this.callbacks.getCueActivity(sessionId, limit);
+	}
+
+	async triggerCueSubscription(
+		subscriptionName: string,
+		prompt?: string,
+		sourceAgentId?: string
+	): Promise<boolean> {
+		if (!this.callbacks.triggerCueSubscription) return false;
+		return this.callbacks.triggerCueSubscription(subscriptionName, prompt, sourceAgentId);
+	}
+
+	async getUsageDashboard(
+		timeRange: 'day' | 'week' | 'month' | 'all'
+	): Promise<UsageDashboardData> {
+		if (!this.callbacks.getUsageDashboard) {
+			return {
+				totalTokensIn: 0,
+				totalTokensOut: 0,
+				totalCost: 0,
+				sessionBreakdown: [],
+				dailyUsage: [],
+			};
+		}
+		return this.callbacks.getUsageDashboard(timeRange);
+	}
+
+	async getAchievements(): Promise<AchievementData[]> {
+		if (!this.callbacks.getAchievements) return [];
+		return this.callbacks.getAchievements();
+	}
+
+	async generateDirectorNotesSynopsis(
+		lookbackDays: number,
+		provider: string
+	): Promise<DirectorNotesSynopsisResult> {
+		if (!this.callbacks.generateDirectorNotesSynopsis) {
+			return { success: false, synopsis: '', error: "Director's Notes synopsis not available" };
+		}
+		return this.callbacks.generateDirectorNotesSynopsis(lookbackDays, provider);
+	}
+
+	async notifyToast(params: NotifyToastParams): Promise<boolean> {
+		if (!this.callbacks.notifyToast) return false;
+		return this.callbacks.notifyToast(params);
+	}
+
+	async cadenzaView(params: CadenzaPayload): Promise<boolean> {
+		if (!this.callbacks.cadenzaView) return false;
+		return this.callbacks.cadenzaView(params);
+	}
+
+	async movementView(params: MovementPayload): Promise<boolean> {
+		if (!this.callbacks.movementView) return false;
+		return this.callbacks.movementView(params);
+	}
+
+	async getMovementState(): Promise<MovementStateSnapshot | null> {
+		if (!this.callbacks.getMovementState) return null;
+		return this.callbacks.getMovementState();
+	}
+
+	async getMovementDesignerInspection(id: string) {
+		if (!this.callbacks.getMovementDesignerInspection) return null;
+		return this.callbacks.getMovementDesignerInspection(id);
+	}
+
+	async interactMovementDesigner(
+		id: string,
+		action: Parameters<InteractMovementDesignerCallback>[1]
+	) {
+		if (!this.callbacks.interactMovementDesigner) {
+			return {
+				ok: false,
+				action: action.kind,
+				selector: action.selector,
+				message: 'Movement designer interaction is not configured',
+			};
+		}
+		return this.callbacks.interactMovementDesigner(id, action);
+	}
+
+	async notifyCenterFlash(params: NotifyCenterFlashParams): Promise<boolean> {
+		if (!this.callbacks.notifyCenterFlash) return false;
+		return this.callbacks.notifyCenterFlash(params);
+	}
+
+	getDebugPackageDeps(): ReturnType<GetDebugPackageDepsCallback> | null {
+		return this.callbacks.getDebugPackageDeps?.() ?? null;
+	}
+
+	async getMarketplaceManifest(options?: {
+		refresh?: boolean;
+	}): Promise<MarketplaceManifestResult | null> {
+		if (!this.callbacks.getMarketplaceManifest) return null;
+		return this.callbacks.getMarketplaceManifest(options);
+	}
+
+	async getMarketplaceDocument(
+		playbookPath: string,
+		filename: string
+	): Promise<{ content: string } | null> {
+		if (!this.callbacks.getMarketplaceDocument) return null;
+		return this.callbacks.getMarketplaceDocument(playbookPath, filename);
+	}
+
+	async getMarketplaceReadme(playbookPath: string): Promise<{ content: string | null } | null> {
+		if (!this.callbacks.getMarketplaceReadme) return null;
+		return this.callbacks.getMarketplaceReadme(playbookPath);
+	}
+
+	async importMarketplacePlaybook(
+		sessionId: string,
+		playbookId: string,
+		targetFolderName: string
+	): Promise<MarketplaceImportResult> {
+		if (!this.callbacks.importMarketplacePlaybook) {
+			return { success: false, error: 'Marketplace import not configured' };
+		}
+		return this.callbacks.importMarketplacePlaybook(sessionId, playbookId, targetFolderName);
+	}
+
+	listDesktopSessions(): DesktopSessionEntry[] {
+		return this.callbacks.listDesktopSessions?.() ?? [];
+	}
+
+	getSessionHistory(
+		tabId: string,
+		options?: GetSessionHistoryOptions
+	): SessionHistoryResult | null {
+		return this.callbacks.getSessionHistory?.(tabId, options) ?? null;
+	}
+
+	// ============ Setter Methods ============
+
+	setGetSessionsCallback(callback: GetSessionsCallback): void {
+		this.callbacks.getSessions = callback;
+	}
+
+	setGetSessionDetailCallback(callback: GetSessionDetailCallback): void {
+		this.callbacks.getSessionDetail = callback;
+	}
+
+	setGetThemeCallback(callback: GetThemeCallback): void {
+		this.callbacks.getTheme = callback;
+	}
+
+	setGetBionifyReadingModeCallback(callback: GetBionifyReadingModeCallback): void {
+		this.callbacks.getBionifyReadingMode = callback;
+	}
+
+	setGetCustomCommandsCallback(callback: GetCustomCommandsCallback): void {
+		this.callbacks.getCustomCommands = callback;
+	}
+
+	setWriteToSessionCallback(callback: WriteToSessionCallback): void {
+		this.callbacks.writeToSession = callback;
+	}
+
+	setExecuteCommandCallback(callback: ExecuteCommandCallback): void {
+		this.callbacks.executeCommand = callback;
+	}
+
+	setInterruptSessionCallback(callback: InterruptSessionCallback): void {
+		this.callbacks.interruptSession = callback;
+	}
+
+	setSwitchModeCallback(callback: SwitchModeCallback): void {
+		logger.info('[CallbackRegistry] setSwitchModeCallback called', LOG_CONTEXT);
+		this.callbacks.switchMode = callback;
+	}
+
+	setSelectSessionCallback(callback: SelectSessionCallback): void {
+		logger.info('[CallbackRegistry] setSelectSessionCallback called', LOG_CONTEXT);
+		this.callbacks.selectSession = callback;
+	}
+
+	setSelectTabCallback(callback: SelectTabCallback): void {
+		logger.info('[CallbackRegistry] setSelectTabCallback called', LOG_CONTEXT);
+		this.callbacks.selectTab = callback;
+	}
+
+	setNewTabCallback(callback: NewTabCallback): void {
+		logger.info('[CallbackRegistry] setNewTabCallback called', LOG_CONTEXT);
+		this.callbacks.newTab = callback;
+	}
+
+	setCloseTabCallback(callback: CloseTabCallback): void {
+		logger.info('[CallbackRegistry] setCloseTabCallback called', LOG_CONTEXT);
+		this.callbacks.closeTab = callback;
+	}
+
+	setRenameTabCallback(callback: RenameTabCallback): void {
+		logger.info('[CallbackRegistry] setRenameTabCallback called', LOG_CONTEXT);
+		this.callbacks.renameTab = callback;
+	}
+
+	setStarTabCallback(callback: StarTabCallback): void {
+		this.callbacks.starTab = callback;
+	}
+
+	setSnoozeCommandCallback(callback: SnoozeCommandCallback): void {
+		this.callbacks.snoozeCommand = callback;
+	}
+
+	setAutoRunSteeringCommandCallback(callback: AutoRunSteeringCommandCallback): void {
+		this.callbacks.autoRunSteeringCommand = callback;
+	}
+
+	setWindowCommandCallback(callback: WindowCommandCallback): void {
+		this.callbacks.windowCommand = callback;
+	}
+
+	setReorderTabCallback(callback: ReorderTabCallback): void {
+		this.callbacks.reorderTab = callback;
+	}
+
+	setToggleBookmarkCallback(callback: ToggleBookmarkCallback): void {
+		this.callbacks.toggleBookmark = callback;
+	}
+
+	setOpenFileTabCallback(callback: OpenFileTabCallback): void {
+		this.callbacks.openFileTab = callback;
+	}
+
+	setOpenDocumentGraphCallback(callback: OpenDocumentGraphCallback): void {
+		this.callbacks.openDocumentGraph = callback;
+	}
+
+	setOpenModalCallback(callback: OpenModalCallback): void {
+		this.callbacks.openModal = callback;
+	}
+
+	setRefreshFileTreeCallback(callback: RefreshFileTreeCallback): void {
+		this.callbacks.refreshFileTree = callback;
+	}
+
+	setOpenBrowserTabCallback(callback: OpenBrowserTabCallback): void {
+		this.callbacks.openBrowserTab = callback;
+	}
+
+	setCloseBrowserTabCallback(callback: CloseBrowserTabCallback): void {
+		this.callbacks.closeBrowserTab = callback;
+	}
+
+	setWriteTerminalTabCallback(callback: WriteTerminalTabCallback): void {
+		this.callbacks.writeTerminalTab = callback;
+	}
+
+	setListTerminalTabsCallback(callback: ListTerminalTabsCallback): void {
+		this.callbacks.listTerminalTabs = callback;
+	}
+
+	setReadTerminalTabCallback(callback: ReadTerminalTabCallback): void {
+		this.callbacks.readTerminalTab = callback;
+	}
+
+	setOpenTerminalTabCallback(callback: OpenTerminalTabCallback): void {
+		this.callbacks.openTerminalTab = callback;
+	}
+
+	setNewAITabWithPromptCallback(callback: NewAITabWithPromptCallback): void {
+		this.callbacks.newAITabWithPrompt = callback;
+	}
+
+	setConsultAgentCallback(callback: ConsultAgentCallback): void {
+		this.callbacks.consultAgent = callback;
+	}
+
+	setNoteAgentDelegationCallback(callback: NoteAgentDelegationCallback): void {
+		this.callbacks.noteAgentDelegation = callback;
+	}
+
+	setEnqueueCommandCallback(callback: EnqueueCommandCallback): void {
+		this.callbacks.enqueueCommand = callback;
+	}
+
+	setListQueueCallback(callback: ListQueueCallback): void {
+		this.callbacks.listQueue = callback;
+	}
+
+	setRemoveQueueItemCallback(callback: RemoveQueueItemCallback): void {
+		this.callbacks.removeQueueItem = callback;
+	}
+
+	setRefreshAutoRunDocsCallback(callback: RefreshAutoRunDocsCallback): void {
+		this.callbacks.refreshAutoRunDocs = callback;
+	}
+
+	setConfigureAutoRunCallback(callback: ConfigureAutoRunCallback): void {
+		this.callbacks.configureAutoRun = callback;
+	}
+
+	setLaunchGoalRunCallback(callback: LaunchGoalRunCallback): void {
+		this.callbacks.launchGoalRun = callback;
+	}
+
+	setSessionAutoRunFolderCallback(callback: SetSessionAutoRunFolderCallback): void {
+		this.callbacks.setSessionAutoRunFolder = callback;
+	}
+
+	setGetHistoryCallback(callback: GetHistoryCallback): void {
+		this.callbacks.getHistory = callback;
+	}
+
+	setGetAutoRunDocsCallback(callback: GetAutoRunDocsCallback): void {
+		this.callbacks.getAutoRunDocs = callback;
+	}
+
+	setGetAutoRunDocContentCallback(callback: GetAutoRunDocContentCallback): void {
+		this.callbacks.getAutoRunDocContent = callback;
+	}
+
+	setSaveAutoRunDocCallback(callback: SaveAutoRunDocCallback): void {
+		this.callbacks.saveAutoRunDoc = callback;
+	}
+
+	setStopAutoRunCallback(callback: StopAutoRunCallback): void {
+		this.callbacks.stopAutoRun = callback;
+	}
+
+	setResetAutoRunDocTasksCallback(callback: ResetAutoRunDocTasksCallback): void {
+		this.callbacks.resetAutoRunDocTasks = callback;
+	}
+
+	setResumeAutoRunErrorCallback(callback: ResumeAutoRunErrorCallback): void {
+		this.callbacks.resumeAutoRunError = callback;
+	}
+
+	setSkipAutoRunDocumentCallback(callback: SkipAutoRunDocumentCallback): void {
+		this.callbacks.skipAutoRunDocument = callback;
+	}
+
+	setAbortAutoRunErrorCallback(callback: AbortAutoRunErrorCallback): void {
+		this.callbacks.abortAutoRunError = callback;
+	}
+
+	setListPlaybooksCallback(callback: ListPlaybooksCallback): void {
+		this.callbacks.listPlaybooks = callback;
+	}
+
+	setCreatePlaybookCallback(callback: CreatePlaybookCallback): void {
+		this.callbacks.createPlaybook = callback;
+	}
+
+	setUpdatePlaybookCallback(callback: UpdatePlaybookCallback): void {
+		this.callbacks.updatePlaybook = callback;
+	}
+
+	setDeletePlaybookCallback(callback: DeletePlaybookCallback): void {
+		this.callbacks.deletePlaybook = callback;
+	}
+
+	setGetSettingsCallback(callback: GetSettingsCallback): void {
+		this.callbacks.getSettings = callback;
+	}
+
+	setSetSettingCallback(callback: SetSettingCallback): void {
+		this.callbacks.setSetting = callback;
+	}
+
+	setGetGroupsCallback(callback: GetGroupsCallback): void {
+		this.callbacks.getGroups = callback;
+	}
+
+	setCreateGroupCallback(callback: CreateGroupCallback): void {
+		this.callbacks.createGroup = callback;
+	}
+
+	setRenameGroupCallback(callback: RenameGroupCallback): void {
+		this.callbacks.renameGroup = callback;
+	}
+
+	setUpdateGroupCallback(callback: UpdateGroupCallback): void {
+		this.callbacks.updateGroup = callback;
+	}
+
+	setDeleteGroupCallback(callback: DeleteGroupCallback): void {
+		this.callbacks.deleteGroup = callback;
+	}
+
+	setMoveSessionToGroupCallback(callback: MoveSessionToGroupCallback): void {
+		this.callbacks.moveSessionToGroup = callback;
+	}
+
+	setCreateSessionCallback(callback: CreateSessionCallback): void {
+		this.callbacks.createSession = callback;
+	}
+
+	setCreateWorktreeSessionCallback(callback: CreateWorktreeSessionCallback): void {
+		this.callbacks.createWorktreeSession = callback;
+	}
+
+	setDeleteSessionCallback(callback: DeleteSessionCallback): void {
+		this.callbacks.deleteSession = callback;
+	}
+
+	setRenameSessionCallback(callback: RenameSessionCallback): void {
+		this.callbacks.renameSession = callback;
+	}
+
+	setUpdateSessionCwdCallback(callback: UpdateSessionCwdCallback): void {
+		this.callbacks.updateSessionCwd = callback;
+	}
+
+	setUpdateSessionSshCallback(callback: UpdateSessionSshCallback): void {
+		this.callbacks.updateSessionSsh = callback;
+	}
+
+	setUpdateSessionConfigCallback(callback: UpdateSessionConfigCallback): void {
+		this.callbacks.updateSessionConfig = callback;
+	}
+
+	setGetGitStatusCallback(callback: GetGitStatusCallback): void {
+		this.callbacks.getGitStatus = callback;
+	}
+
+	setGetGitDiffCallback(callback: GetGitDiffCallback): void {
+		this.callbacks.getGitDiff = callback;
+	}
+
+	setGetGitBranchesForSessionCallback(callback: GetGitBranchesForSessionCallback): void {
+		this.callbacks.getGitBranchesForSession = callback;
+	}
+
+	setListWorktreesForSessionCallback(callback: ListWorktreesForSessionCallback): void {
+		this.callbacks.listWorktreesForSession = callback;
+	}
+
+	setGetGroupChatsCallback(callback: GetGroupChatsCallback): void {
+		this.callbacks.getGroupChats = callback;
+	}
+
+	setStartGroupChatCallback(callback: StartGroupChatCallback): void {
+		this.callbacks.startGroupChat = callback;
+	}
+
+	setGetGroupChatStateCallback(callback: GetGroupChatStateCallback): void {
+		this.callbacks.getGroupChatState = callback;
+	}
+
+	setStopGroupChatCallback(callback: StopGroupChatCallback): void {
+		this.callbacks.stopGroupChat = callback;
+	}
+
+	setSendGroupChatMessageCallback(callback: SendGroupChatMessageCallback): void {
+		this.callbacks.sendGroupChatMessage = callback;
+	}
+
+	setMergeContextCallback(callback: MergeContextCallback): void {
+		this.callbacks.mergeContext = callback;
+	}
+
+	setTransferContextCallback(callback: TransferContextCallback): void {
+		this.callbacks.transferContext = callback;
+	}
+
+	setSummarizeContextCallback(callback: SummarizeContextCallback): void {
+		this.callbacks.summarizeContext = callback;
+	}
+
+	setCreateGistCallback(callback: CreateGistCallback): void {
+		this.callbacks.createGist = callback;
+	}
+
+	setGetCueSubscriptionsCallback(callback: GetCueSubscriptionsCallback): void {
+		this.callbacks.getCueSubscriptions = callback;
+	}
+
+	setToggleCueSubscriptionCallback(callback: ToggleCueSubscriptionCallback): void {
+		this.callbacks.toggleCueSubscription = callback;
+	}
+
+	setGetCueActivityCallback(callback: GetCueActivityCallback): void {
+		this.callbacks.getCueActivity = callback;
+	}
+
+	setTriggerCueSubscriptionCallback(callback: TriggerCueSubscriptionCallback): void {
+		this.callbacks.triggerCueSubscription = callback;
+	}
+
+	setGetUsageDashboardCallback(callback: GetUsageDashboardCallback): void {
+		this.callbacks.getUsageDashboard = callback;
+	}
+
+	setGetAchievementsCallback(callback: GetAchievementsCallback): void {
+		this.callbacks.getAchievements = callback;
+	}
+
+	setGenerateDirectorNotesSynopsisCallback(callback: GenerateDirectorNotesSynopsisCallback): void {
+		this.callbacks.generateDirectorNotesSynopsis = callback;
+	}
+
+	setNotifyToastCallback(callback: NotifyToastCallback): void {
+		this.callbacks.notifyToast = callback;
+	}
+
+	setCadenzaViewCallback(callback: CadenzaViewCallback): void {
+		this.callbacks.cadenzaView = callback;
+	}
+
+	setMovementViewCallback(callback: MovementViewCallback): void {
+		this.callbacks.movementView = callback;
+	}
+
+	setGetMovementStateCallback(callback: GetMovementStateCallback): void {
+		this.callbacks.getMovementState = callback;
+	}
+
+	setGetMovementDesignerInspectionCallback(callback: GetMovementDesignerInspectionCallback): void {
+		this.callbacks.getMovementDesignerInspection = callback;
+	}
+
+	setInteractMovementDesignerCallback(callback: InteractMovementDesignerCallback): void {
+		this.callbacks.interactMovementDesigner = callback;
+	}
+
+	setNotifyCenterFlashCallback(callback: NotifyCenterFlashCallback): void {
+		this.callbacks.notifyCenterFlash = callback;
+	}
+
+	setGetDebugPackageDepsCallback(callback: GetDebugPackageDepsCallback): void {
+		this.callbacks.getDebugPackageDeps = callback;
+	}
+
+	setGetMarketplaceManifestCallback(callback: GetMarketplaceManifestCallback): void {
+		this.callbacks.getMarketplaceManifest = callback;
+	}
+
+	setGetMarketplaceDocumentCallback(callback: GetMarketplaceDocumentCallback): void {
+		this.callbacks.getMarketplaceDocument = callback;
+	}
+
+	setGetMarketplaceReadmeCallback(callback: GetMarketplaceReadmeCallback): void {
+		this.callbacks.getMarketplaceReadme = callback;
+	}
+
+	setImportMarketplacePlaybookCallback(callback: ImportMarketplacePlaybookCallback): void {
+		this.callbacks.importMarketplacePlaybook = callback;
+	}
+
+	setListDesktopSessionsCallback(callback: ListDesktopSessionsCallback): void {
+		this.callbacks.listDesktopSessions = callback;
+	}
+
+	setGetSessionHistoryCallback(callback: GetSessionHistoryCallback): void {
+		this.callbacks.getSessionHistory = callback;
+	}
+
+	// ============ Check Methods ============
+
+	hasCallback(name: keyof WebServerCallbacks): boolean {
+		return this.callbacks[name] !== null;
+	}
+}
